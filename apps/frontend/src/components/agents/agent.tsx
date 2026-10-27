@@ -14,13 +14,14 @@ import useSWR from 'swr';
 import { orderBy } from 'lodash';
 import { SVGLine } from '@gitroom/frontend/components/launches/launches.component';
 import ImageWithFallback from '@gitroom/react/helpers/image.with.fallback';
-import Image from 'next/image';
+import SafeImage from '@gitroom/react/helpers/safe.image';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import { useWaitForClass } from '@gitroom/helpers/utils/use.wait.for.class';
 import { MultiMediaComponent } from '@gitroom/frontend/components/media/media.component';
 import { Integration } from '@prisma/client';
 import Link from 'next/link';
 import { useParams, usePathname, useRouter } from 'next/navigation';
+import { useT } from '@gitroom/react/translation/get.transation.service.client';
 
 export const MediaPortal: FC<{
   media: { path: string; id: string }[];
@@ -39,13 +40,14 @@ export const MediaPortal: FC<{
   }) => void;
 }> = ({ media, setMedia, value }) => {
   const waitForClass = useWaitForClass('copilotKitMessages');
+  const t = useT();
   if (!waitForClass) return null;
   return (
     <div className="pl-[14px] pr-[24px] whitespace-nowrap editor rm-bg">
       <MultiMediaComponent
         allData={[{ content: value }]}
         text={value}
-        label="Attachments"
+        label={t('attachments', 'Attachments')}
         description=""
         value={media}
         dummy={false}
@@ -62,6 +64,7 @@ export const AgentList: FC<{ onChange: (arr: any[]) => void }> = ({
   onChange,
 }) => {
   const fetch = useFetch();
+  const t = useT();
   const [selected, setSelected] = useState([]);
 
   const load = useCallback(async () => {
@@ -104,14 +107,14 @@ export const AgentList: FC<{ onChange: (arr: any[]) => void }> = ({
   return (
     <div
       className={clsx(
-        'trz bg-newBgColorInner flex flex-col gap-[15px] transition-all relative',
+        'trz bg-newBgColorInner flex flex-col gap-[15px] transition-all relative mobile:w-full mobile:order-1',
         collapseMenu === '1' ? 'group sidebar w-[100px]' : 'w-[260px]'
       )}
     >
-      <div className="absolute top-0 start-0 w-full h-full p-[20px] overflow-auto scrollbar scrollbar-thumb-fifth scrollbar-track-newBgColor">
-        <div className="flex items-center">
+      <div className="absolute top-0 start-0 w-full h-full p-[20px] mobile:p-[12px] mobile:static mobile:h-auto overflow-auto scrollbar scrollbar-thumb-fifth scrollbar-track-newBgColor">
+        <div className="flex items-center mobile:hidden">
           <h2 className="group-[.sidebar]:hidden flex-1 text-[20px] font-[500] mb-[15px]">
-            Select Channels
+            {t('select_channels', 'Select Channels')}
           </h2>
           <div
             onClick={() => setCollapseMenu(collapseMenu === '1' ? '0' : '1')}
@@ -134,13 +137,17 @@ export const AgentList: FC<{ onChange: (arr: any[]) => void }> = ({
             </svg>
           </div>
         </div>
-        <div className={clsx('flex flex-col gap-[15px]')}>
+        <div
+          className={clsx(
+            'flex flex-col gap-[15px] mobile:flex-row mobile:gap-[12px] mobile:ps-[12px] mobile:pt-[6px]'
+          )}
+        >
           {sortedIntegrations.map((integration, index) => (
             <div
               onClick={setIntegration(integration)}
               key={integration.id}
               className={clsx(
-                'flex gap-[12px] items-center group/profile justify-center hover:bg-boxHover rounded-e-[8px] hover:opacity-100 cursor-pointer',
+                'flex gap-[12px] items-center group/profile justify-center hover:bg-boxHover rounded-e-[8px] hover:opacity-100 cursor-pointer mobile:shrink-0',
                 !selected.some((p) => p.id === integration.id) && 'opacity-20'
               )}
             >
@@ -169,7 +176,7 @@ export const AgentList: FC<{ onChange: (arr: any[]) => void }> = ({
                   width={36}
                   height={36}
                 />
-                <Image
+                <SafeImage
                   src={`/icons/platforms/${integration.identifier}.png`}
                   className="rounded-[8px] absolute z-10 bottom-[5px] -end-[5px] border border-fifth"
                   alt={integration.identifier}
@@ -179,7 +186,7 @@ export const AgentList: FC<{ onChange: (arr: any[]) => void }> = ({
               </div>
               <div
                 className={clsx(
-                  'flex-1 whitespace-nowrap text-ellipsis overflow-hidden group-[.sidebar]:hidden',
+                  'flex-1 whitespace-nowrap text-ellipsis overflow-hidden group-[.sidebar]:hidden mobile:hidden',
                   integration.disabled && 'opacity-50'
                 )}
               >
@@ -200,7 +207,9 @@ export const Agent: FC<{ children: ReactNode }> = ({ children }) => {
   return (
     <PropertiesContext.Provider value={{ properties }}>
       <AgentList onChange={setProperties} />
-      <div className="bg-newBgColorInner flex flex-1">{children}</div>
+      <div className="bg-newBgColorInner flex flex-1 mobile:order-3 mobile:min-h-[500px]">
+        {children}
+      </div>
       <Threads />
     </PropertiesContext.Provider>
   );
@@ -210,6 +219,7 @@ const Threads: FC = () => {
   const fetch = useFetch();
   const router = useRouter();
   const pathname = usePathname();
+  const t = useT();
   const threads = useCallback(async () => {
     return (await fetch('/copilot/list')).json();
   }, []);
@@ -221,11 +231,11 @@ const Threads: FC = () => {
     <div
       className={clsx(
         'trz bg-newBgColorInner flex flex-col gap-[15px] transition-all relative',
-        'w-[260px]'
+        'w-[260px] mobile:w-full mobile:order-2'
       )}
     >
-      <div className="absolute top-0 start-0 w-full h-full p-[20px] overflow-auto scrollbar scrollbar-thumb-fifth scrollbar-track-newBgColor">
-        <div className="mb-[15px] justify-center flex group-[.sidebar]:pb-[15px]">
+      <div className="absolute top-0 start-0 w-full h-full p-[20px] mobile:p-[12px] mobile:static mobile:h-auto mobile:flex mobile:gap-[8px] mobile:items-center overflow-auto scrollbar scrollbar-thumb-fifth scrollbar-track-newBgColor">
+        <div className="mb-[15px] mobile:mb-0 justify-center flex group-[.sidebar]:pb-[15px] mobile:shrink-0">
           <Link
             href={`/agents`}
             className="text-white whitespace-nowrap flex-1 pt-[12px] pb-[14px] ps-[16px] pe-[20px] group-[.sidebar]:p-0 min-h-[44px] max-h-[44px] rounded-md bg-btnPrimary flex justify-center items-center gap-[5px] outline-none"
@@ -247,15 +257,15 @@ const Threads: FC = () => {
               />
             </svg>
             <div className="flex-1 text-start text-[16px] group-[.sidebar]:hidden">
-              Start a new chat
+              {t('start_a_new_chat', 'Start a new chat')}
             </div>
           </Link>
         </div>
-        <div className="flex flex-col gap-[1px]">
+        <div className="flex flex-col gap-[1px] mobile:flex-row mobile:gap-[4px]">
           {data?.threads?.map((p: any) => (
             <Link
               className={clsx(
-                'overflow-ellipsis overflow-hidden whitespace-nowrap hover:bg-newBgColor px-[10px] py-[6px] rounded-[10px] cursor-pointer',
+                'overflow-ellipsis overflow-hidden whitespace-nowrap hover:bg-newBgColor px-[10px] py-[6px] rounded-[10px] cursor-pointer mobile:shrink-0 mobile:max-w-[180px] mobile:border mobile:border-newTableBorder',
                 p.id === id && 'bg-newBgColor'
               )}
               href={`/agents/${p.id}`}

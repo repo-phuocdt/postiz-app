@@ -6,12 +6,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
+import useCookie from 'react-use-cookie';
 export const AfterActivate = () => {
   const fetch = useFetch();
   const params = useParams();
   const [showLoader, setShowLoader] = useState(true);
   const run = useRef(false);
   const t = useT();
+  const [datafast_visitor_id] = useCookie('datafast_visitor_id');
 
   useEffect(() => {
     if (!run.current) {
@@ -21,17 +23,20 @@ export const AfterActivate = () => {
   }, []);
   const loadCode = useCallback(async () => {
     if (params.code) {
-      const { can } = await (
-        await fetch(`/auth/activate`, {
-          method: 'POST',
-          body: JSON.stringify({
-            code: params.code,
-          }),
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        })
-      ).json();
+      const response = await fetch(`/auth/activate`, {
+        method: 'POST',
+        body: JSON.stringify({
+          code: params.code,
+          datafast_visitor_id,
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      if (response.headers.get('onboarding')) {
+        return;
+      }
+      const { can } = await response.json();
       if (!can) {
         setShowLoader(false);
       }

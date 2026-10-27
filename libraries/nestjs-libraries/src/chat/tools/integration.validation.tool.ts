@@ -6,7 +6,7 @@ import {
   IntegrationManager,
   socialIntegrationList,
 } from '@gitroom/nestjs-libraries/integrations/integration.manager';
-import { validationMetadatasToSchemas } from 'class-validator-jsonschema';
+import { getValidationSchemas } from '@gitroom/nestjs-libraries/chat/validation.schemas.helper';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
 
 @Injectable()
@@ -21,7 +21,17 @@ export class IntegrationValidationTool implements AgentToolInterface {
          This tool helps us get the schema of the integration.
          Sometimes we might get a schema back the requires some id, for that, you can get information from 'tools'
          And use the triggerTool function.
+         'tools' can also include a mention lookup, use it to tag people or pages in the post content.
         `,
+      mcp: {
+        annotations: {
+          title: 'Get Integration Schema',
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
       inputSchema: z.object({
         isPremium: z
           .boolean()
@@ -72,11 +82,10 @@ export class IntegrationValidationTool implements AgentToolInterface {
             ),
         }),
       }),
-      execute: async (args, options) => {
-        const { context, runtimeContext } = args;
-        checkAuth(args, options);
+      execute: async (inputData, context) => {
+        checkAuth(inputData, context);
         const integration = socialIntegrationList.find(
-          (p) => p.identifier === context.platform
+          (p) => p.identifier === inputData.platform
         )!;
 
         if (!integration) {
@@ -85,10 +94,10 @@ export class IntegrationValidationTool implements AgentToolInterface {
           };
         }
 
-        const maxLength = integration.maxLength(context.isPremium);
+        const maxLength = integration.maxLength(inputData.isPremium);
         const schemas = !integration.dto
           ? false
-          : validationMetadatasToSchemas()[integration.dto.name];
+          : getValidationSchemas()[integration.dto.name];
         const tools = this._integrationManager.getAllTools();
         const rules = this._integrationManager.getAllRulesDescription();
 

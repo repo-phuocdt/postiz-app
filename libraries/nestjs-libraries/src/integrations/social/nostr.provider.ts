@@ -4,13 +4,14 @@ import {
   PostResponse,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
-import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
+import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
 import dayjs from 'dayjs';
 import { SocialAbstract } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { getPublicKey, Relay, finalizeEvent, SimplePool } from 'nostr-tools';
 
 import WebSocket from 'ws';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
+import { Integration } from '@prisma/client';
 
 // @ts-ignore
 global.WebSocket = WebSocket;
@@ -26,12 +27,13 @@ const list = [
 const pool = new SimplePool();
 
 export class NostrProvider extends SocialAbstract implements SocialProvider {
-  override maxConcurrentJob = 5; // Nostr relays typically have generous limits
+  override maxConcurrentJob = 5;
   identifier = 'nostr';
   name = 'Nostr';
   isBetweenSteps = false;
   scopes = [] as string[];
   editor = 'normal' as const;
+  toolTip = 'Make sure you private a HEX key of your Nostr private key, you can get it from websites like iris.to'
 
   maxLength() {
     return 100000;
@@ -61,12 +63,18 @@ export class NostrProvider extends SocialAbstract implements SocialProvider {
   }
 
   async generateAuthUrl() {
-    const state = makeId(17);
+    const state = makeSecureId(17);
     return {
-      url: '',
-      codeVerifier: makeId(10),
+      url: state,
+      codeVerifier: makeSecureId(10),
       state,
     };
+  }
+
+  private secretKey(password: string) {
+    return Uint8Array.from(
+      (password.match(/.{1,2}/g) || []).map((byte: any) => parseInt(byte, 16))
+    );
   }
 
   private async findRelayInformation(pubkey: string) {
@@ -135,11 +143,7 @@ export class NostrProvider extends SocialAbstract implements SocialProvider {
     try {
       const body = JSON.parse(Buffer.from(params.code, 'base64').toString());
 
-      const pubkey = getPublicKey(
-        Uint8Array.from(
-          body.password.match(/.{1,2}/g).map((byte: any) => parseInt(byte, 16))
-        )
-      );
+      const pubkey = getPublicKey(this.secretKey(body.password));
 
       const user = await this.findRelayInformation(pubkey);
 
@@ -158,43 +162,77 @@ export class NostrProvider extends SocialAbstract implements SocialProvider {
     }
   }
 
+  private buildContent(post: PostDetails): string {
+    const mediaContent = post.media?.map((m) => m.path).join('\n\n') || '';
+    return mediaContent
+      ? `${post.message}\n\n${mediaContent}`
+      : post.message;
+  }
+
   async post(
     id: string,
     accessToken: string,
     postDetails: PostDetails[]
   ): Promise<PostResponse[]> {
     const { password } = AuthService.verifyJWT(accessToken) as any;
+    const [firstPost] = postDetails;
 
-    let lastId = '';
-    const ids: PostResponse[] = [];
-    for (const post of postDetails) {
-      const textEvent = finalizeEvent(
-        {
-          kind: 1, // Text note
-          content:
-            post.message + '\n\n' + post.media?.map((m) => m.path).join('\n\n'),
-          tags: [
-            ...(lastId
-              ? [
-                  ['e', lastId, '', 'reply'],
-                  ['p', id],
-                ]
-              : []),
-          ], // Include delegation token in the event
-          created_at: Math.floor(Date.now() / 1000),
-        },
-        password
-      );
+    const textEvent = finalizeEvent(
+      {
+        kind: 1, // Text note
+        content: this.buildContent(firstPost),
+        tags: [],
+        created_at: Math.floor(Date.now() / 1000),
+      },
+      this.secretKey(password)
+    );
 
-      lastId = await this.publish(id, textEvent);
-      ids.push({
-        id: post.id,
-        postId: String(lastId),
-        releaseURL: `https://primal.net/e/${lastId}`,
+    const eventId = await this.publish(id, textEvent);
+
+    return [
+      {
+        id: firstPost.id,
+        postId: String(eventId),
+        releaseURL: `https://primal.net/e/${eventId}`,
         status: 'completed',
-      });
-    }
+      },
+    ];
+  }
 
-    return ids;
+  async comment(
+    id: string,
+    postId: string,
+    lastCommentId: string | undefined,
+    accessToken: string,
+    postDetails: PostDetails[],
+    integration: Integration
+  ): Promise<PostResponse[]> {
+    const { password } = AuthService.verifyJWT(accessToken) as any;
+    const [commentPost] = postDetails;
+    const replyToId = lastCommentId || postId;
+
+    const textEvent = finalizeEvent(
+      {
+        kind: 1, // Text note
+        content: this.buildContent(commentPost),
+        tags: [
+          ['e', replyToId, '', 'reply'],
+          ['p', id],
+        ],
+        created_at: Math.floor(Date.now() / 1000),
+      },
+      this.secretKey(password)
+    );
+
+    const eventId = await this.publish(id, textEvent);
+
+    return [
+      {
+        id: commentPost.id,
+        postId: String(eventId),
+        releaseURL: `https://primal.net/e/${eventId}`,
+        status: 'completed',
+      },
+    ];
   }
 }

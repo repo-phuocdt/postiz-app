@@ -1,10 +1,11 @@
 'use client';
 
-import { FC, useCallback, useState } from 'react';
+import { FC, ReactNode, useCallback, useState } from 'react';
 import clsx from 'clsx';
 import { useVariables } from '@gitroom/react/helpers/variable.context';
 import { useUser } from '@gitroom/frontend/components/layout/user.context';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
+import DeleteAccountComponent from '@gitroom/frontend/components/settings/delete-account.component';
 const useFaqList = () => {
   const { isGeneral } = useVariables();
   const user = useUser();
@@ -19,7 +20,7 @@ const useFaqList = () => {
             ),
             description: t(
               'faq_to_confirm_credit_card_information_postiz_will_hold',
-              'To confirm credit card information Postiz will hold $2 and release it immediately'
+              'To confirm credit card information Postiz will hold $2 and release it immediately, you can cancel your subscription anytime from settings without talking to a person'
             ),
           },
         ]
@@ -56,13 +57,31 @@ For example, you can schedule your posts on X, Facebook, Instagram, TikTok, YouT
         'If you have a team with multiple members, you can invite them to your workspace to collaborate on your posts and add their personal channels'
       ),
     },
+    ...(user?.tier?.current === 'FREE'
+      ? [
+          {
+            title: t(
+              'faq_how_can_i_delete_my_account',
+              'How can I delete my account?'
+            ),
+            description: t(
+              'faq_delete_account_description',
+              `If you don't want to continue using ${
+                isGeneral ? 'Postiz' : 'Gitroom'
+              }, you can delete your account, including all your organizations, channels and posts. This action cannot be undone.`
+            ),
+            content: <DeleteAccountComponent isLink={true} />,
+          },
+        ]
+      : []),
   ];
 };
 export const FAQSection: FC<{
   title: string;
   description: string;
+  content?: ReactNode;
 }> = (props) => {
-  const { title, description } = props;
+  const { title, description, content } = props;
   const [show, setShow] = useState(false);
   const changeShow = useCallback(() => {
     setShow(!show);
@@ -72,9 +91,7 @@ export const FAQSection: FC<{
       className="bg-sixth p-[24px] border border-tableBorder rounded-[8px] flex flex-col"
       onClick={changeShow}
     >
-      <div
-        className={`text-[20px] cursor-pointer flex justify-center`}
-      >
+      <div className={`text-[20px] cursor-pointer flex justify-center`}>
         <div className="flex-1">{title}</div>
         <div className="flex items-center justify-center w-[32px]">
           {!show ? (
@@ -120,11 +137,21 @@ export const FAQSection: FC<{
           onClick={(e) => {
             e.stopPropagation();
           }}
-          className={`mt-[16px] w-full text-wrap font-[400] text-[16px] text-customColor17 select-text`}
+          className={`mt-[16px] w-full text-wrap font-[400] text-[16px] text-customColor17 select-text max-w-[450px]`}
           dangerouslySetInnerHTML={{
             __html: description,
           }}
         />
+        {content && (
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+            }}
+            className="mt-[16px]"
+          >
+            {content}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -134,10 +161,10 @@ export const FAQComponent: FC = () => {
   const list = useFaqList();
   return (
     <div>
-      <h3 className="text-[24px] mt-[48px] mb-[40px] tablet:mt-[80px]">
-        {t('frequently_asked_questions', 'Frequently Asked Questions')}
-      </h3>
-      <div className="gap-[24px] flex-col flex select-none">
+      {/*<h3 className="text-[24px] mt-[48px] mb-[40px] tablet:mt-[80px]">*/}
+      {/*  {t('frequently_asked_questions', 'Frequently Asked Questions')}*/}
+      {/*</h3>*/}
+      <div className="gap-[24px] flex-col flex select-none  mt-[48px] mb-[40px] tablet:mt-[80px]">
         {list.map((item, index) => (
           <FAQSection key={index} {...item} />
         ))}

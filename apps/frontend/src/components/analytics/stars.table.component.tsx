@@ -1,3 +1,5 @@
+'use client';
+
 import {
   FC,
   useCallback,
@@ -8,13 +10,13 @@ import {
 } from 'react';
 import { UtcToLocalDateRender } from '@gitroom/react/helpers/utc.date.render';
 import { Button } from '@gitroom/react/form/button';
-import dayjs from 'dayjs';
+import { fromUtc } from '@gitroom/frontend/components/layout/set.timezone';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import useSWR from 'swr';
 import clsx from 'clsx';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
-import ReactLoading from 'react-loading';
+import ReactLoading from '@gitroom/frontend/components/layout/loading';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 
 export const UpDown: FC<{
@@ -136,7 +138,7 @@ export const StarsTableComponent = () => {
     mutate();
   }, [searchParams]);
   const renderMediaLink = useCallback((date: string) => {
-    const local = dayjs.utc(date).local();
+    const local = fromUtc(date);
     const weekNumber = local.isoWeek();
     const year = local.year();
     return `/launches?week=${weekNumber}&year=${year}`;
@@ -205,22 +207,22 @@ export const StarsTableComponent = () => {
             <thead>
               <tr>
                 <th>
-                  <UpDown name="Repository" param="login" />
+                  <UpDown name={t('repository', 'Repository')} param="login" />
                 </th>
                 <th>
-                  <UpDown name="Date" param="date" />
+                  <UpDown name={t('date', 'Date')} param="date" />
                 </th>
                 <th>
-                  <UpDown name="Total Stars" param="totalStars" />
+                  <UpDown name={t('total_stars', 'Total Stars')} param="totalStars" />
                 </th>
                 <th>
-                  <UpDown name="Total Fork" param="totalForks" />
+                  <UpDown name={t('total_forks', 'Total Forks')} param="totalForks" />
                 </th>
                 <th>
-                  <UpDown name="Stars" param="stars" />
+                  <UpDown name={t('stars', 'Stars')} param="stars" />
                 </th>
                 <th>
-                  <UpDown name="Forks" param="forks" />
+                  <UpDown name={t('forks', 'Forks')} param="forks" />
                 </th>
                 <th>{t('media', 'Media')}</th>
               </tr>

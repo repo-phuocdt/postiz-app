@@ -1,3 +1,5 @@
+'use client';
+
 import { TopTitle } from '@gitroom/frontend/components/launches/helpers/top.title.component';
 import React, { FC, FormEventHandler, useCallback, useState } from 'react';
 import { Integrations } from '@gitroom/frontend/components/launches/calendar.context';
@@ -17,7 +19,9 @@ export const BotPicture: FC<{
   const t = useT();
   const modal = useModals();
   const toast = useToaster();
-  const [nick, setNickname] = useState(props.integration.name);
+  const [nick, setNickname] = useState(
+    props.integration.originalName || props.integration.name
+  );
   const [picture, setPicture] = useState(
     props.integration.picture || '/no-picture.jpg'
   );
@@ -33,7 +37,7 @@ export const BotPicture: FC<{
         }),
       });
       props.mutate();
-      toast.show('Updated', 'success');
+      toast.show(t('updated', 'Updated'), 'success');
       modal.closeAll();
     },
     [nick, picture, props.mutate]
@@ -45,7 +49,7 @@ export const BotPicture: FC<{
   }, []);
   return (
     <div className="rounded-[4px] border border-customColor6 bg-sixth px-[16px] pb-[16px] relative w-full">
-      <TopTitle title={`Change Bot Picture`} />
+      <TopTitle title={t('change_bot_picture_title', 'Change Bot Picture')} />
       <button
         className="outline-none absolute end-[20px] top-[20px] mantine-UnstyledButton-root mantine-ActionIcon-root hover:bg-tableBorder cursor-pointer mantine-Modal-close mantine-1dcetaa"
         type="button"
@@ -86,7 +90,7 @@ export const BotPicture: FC<{
               value={nick}
               onChange={(e) => setNickname(e.target.value)}
               name="Nickname"
-              label="Nickname"
+              label={t('label_nickname', 'Nickname')}
               placeholder=""
               disableForm={true}
             />

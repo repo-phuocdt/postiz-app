@@ -28,7 +28,8 @@ function LayoutContextInner(params: { children: ReactNode }) {
     async (url: string, options: RequestInit, response: Response) => {
       if (
         typeof window !== 'undefined' &&
-        window.location.href.includes('/p/')
+        (window.location.href.includes('/p/') ||
+          window.location.pathname.startsWith('/provider/'))
       ) {
         return true;
       }
@@ -90,8 +91,8 @@ function LayoutContextInner(params: { children: ReactNode }) {
       if (response.status === 406) {
         if (
           await deleteDialog(
-            'You are currently on trial, in order to use the feature you must finish the trial',
-            'Finish the trial, charge me now',
+            "This feature is not available during the trial. You can end the trial now: your plan's first payment is charged today instead of at the end of the trial.",
+            'End trial and pay now',
             'Trial',
 
           )
@@ -106,7 +107,10 @@ function LayoutContextInner(params: { children: ReactNode }) {
         if (
           await deleteDialog(
             (
-              await response.json()
+              await response
+                .clone()
+                .json()
+                .catch(() => ({}))
             ).message,
             'Move to billing',
             'Payment Required'

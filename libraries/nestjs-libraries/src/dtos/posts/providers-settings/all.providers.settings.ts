@@ -7,6 +7,8 @@ import { LemmySettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers
 import { DribbbleDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/dribbble.dto';
 import { DiscordDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/discord.dto';
 import { SlackDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/slack.dto';
+import { KickDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/kick.dto';
+import { TwitchDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/twitch.dto';
 import { InstagramDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/instagram.dto';
 import { LinkedinDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/linkedin.dto';
 import { IsIn } from 'class-validator';
@@ -18,6 +20,11 @@ import { ListmonkDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-sett
 import { GmbSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/gmb.settings.dto';
 import { FarcasterDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/farcaster.dto';
 import { FacebookDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/facebook.dto';
+import { MoltbookDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/moltbook.dto';
+import { SkoolDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/skool.dto';
+import { WhopDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/whop.dto';
+import { MeweDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/mewe.dto';
+import { TumblrDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/tumblr.dto';
 
 export type ProviderExtension<T extends string, M> = { __type: T } & M;
 export type AllProvidersSettings =
@@ -27,8 +34,11 @@ export type AllProvidersSettings =
   | ProviderExtension<'pinterest', PinterestSettingsDto>
   | ProviderExtension<'dribbble', DribbbleDto>
   | ProviderExtension<'tiktok', TikTokDto>
+  | ProviderExtension<'tiktok-business', TikTokDto>
   | ProviderExtension<'discord', DiscordDto>
   | ProviderExtension<'slack', SlackDto>
+  | ProviderExtension<'kick', KickDto>
+  | ProviderExtension<'twitch', TwitchDto>
   | ProviderExtension<'x', XDto>
   | ProviderExtension<'linkedin', LinkedinDto>
   | ProviderExtension<'linkedin-page', LinkedinDto>
@@ -47,7 +57,12 @@ export type AllProvidersSettings =
   | ProviderExtension<'bluesky', None>
   | ProviderExtension<'telegram', None>
   | ProviderExtension<'nostr', None>
-  | ProviderExtension<'vk', None>;
+  | ProviderExtension<'moltbook', MoltbookDto>
+  | ProviderExtension<'vk', None>
+  | ProviderExtension<'skool', SkoolDto>
+  | ProviderExtension<'mewe', MeweDto>
+  | ProviderExtension<'tumblr', TumblrDto>
+  | ProviderExtension<'whop', WhopDto>;
 
 type None = NonNullable<unknown>;
 
@@ -59,8 +74,11 @@ export const allProviders = (setEmpty?: any) => {
     { value: PinterestSettingsDto, name: 'pinterest' },
     { value: DribbbleDto, name: 'dribbble' },
     { value: TikTokDto, name: 'tiktok' },
+    { value: TikTokDto, name: 'tiktok-business' },
     { value: DiscordDto, name: 'discord' },
     { value: SlackDto, name: 'slack' },
+    { value: KickDto, name: 'kick' },
+    { value: TwitchDto, name: 'twitch' },
     { value: XDto, name: 'x' },
     { value: LinkedinDto, name: 'linkedin' },
     { value: LinkedinDto, name: 'linkedin-page' },
@@ -80,6 +98,11 @@ export const allProviders = (setEmpty?: any) => {
     { value: setEmpty, name: 'telegram' },
     { value: setEmpty, name: 'nostr' },
     { value: setEmpty, name: 'vk' },
+    { value: MoltbookDto, name: 'moltbook' },
+    { value: SkoolDto, name: 'skool' },
+    { value: WhopDto, name: 'whop' },
+    { value: MeweDto, name: 'mewe' },
+    { value: TumblrDto, name: 'tumblr' },
   ].filter((f) => f.value);
 };
 

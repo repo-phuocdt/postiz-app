@@ -1,13 +1,23 @@
 'use client';
 
-import { FC, RefObject, useEffect, useRef, useState } from 'react';
-import { useLaunchStore } from '@gitroom/frontend/components/new-launch/store';
+import { FC, RefObject, useCallback, useEffect, useRef, useState } from 'react';
+import {
+  SelectedIntegrations,
+  useLaunchStore,
+} from '@gitroom/frontend/components/new-launch/store';
 import clsx from 'clsx';
-import Image from 'next/image';
+import SafeImage from '@gitroom/react/helpers/safe.image';
 import { useShallow } from 'zustand/react/shallow';
 import { GlobalIcon } from '@gitroom/frontend/components/ui/icons';
+import { useT } from '@gitroom/react/translation/get.transation.service.client';
+import { Integrations } from '@gitroom/frontend/components/launches/calendar.context';
+import { useExistingData } from '@gitroom/frontend/components/launches/helpers/use.existing.data';
+import {
+  useDecisionModal,
+  useModals,
+} from '@gitroom/frontend/components/layout/new-modal';
 
-export function useHasScroll(ref: RefObject<HTMLElement>): boolean {
+export function useHasScroll(ref: RefObject<HTMLElement | null>): boolean {
   const [hasHorizontalScroll, setHasHorizontalScroll] = useState(false);
 
   useEffect(() => {
@@ -42,55 +52,77 @@ export function useHasScroll(ref: RefObject<HTMLElement>): boolean {
 }
 
 export const SelectCurrent: FC = () => {
-  const { selectedIntegrations, current, setCurrent, locked, setHide, hide } =
-    useLaunchStore(
-      useShallow((state) => ({
-        selectedIntegrations: state.selectedIntegrations,
-        current: state.current,
-        setCurrent: state.setCurrent,
-        locked: state.locked,
-        hide: state.hide,
-        setHide: state.setHide,
-      }))
-    );
+  const modals = useDecisionModal();
+  const existingData = useExistingData();
+  const {
+    selectedIntegrations,
+    current,
+    setCurrent,
+    locked,
+    setHide,
+    addOrRemoveSelectedIntegration,
+  } = useLaunchStore(
+    useShallow((state) => ({
+      selectedIntegrations: state.selectedIntegrations,
+      addOrRemoveSelectedIntegration: state.addOrRemoveSelectedIntegration,
+      current: state.current,
+      setCurrent: state.setCurrent,
+      locked: state.locked,
+      setHide: state.setHide,
+    }))
+  );
 
   const contentRef = useRef<HTMLDivElement>(null);
   const hasScroll = useHasScroll(contentRef);
 
-  useEffect(() => {
-    if (!hide) {
-      return;
-    }
+  const removeSocial = useCallback(
+    (sIntegration: Integrations) => async (e: any) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const open = await modals.open({
+        title: 'Remove Social Account',
+        description:
+          'Are you sure you want to remove this social from scheduling?',
+      });
 
-    setHide(false);
-  }, [hide]);
+      if (!open) {
+        return;
+      }
+
+      addOrRemoveSelectedIntegration(sIntegration, {});
+    },
+    []
+  );
 
   return (
     <>
-      <div className="select-none left-0 absolute w-full z-[100] px-[20px]">
+      <div className="select-none left-0 absolute w-full z-[100] px-[20px] mobile:static mobile:px-0">
         <div
           ref={contentRef}
           className={clsx(
-            'flex gap-[6px] w-full overflow-x-auto scrollbar scrollbar-thumb-tableBorder scrollbar-track-secondary',
+            'flex gap-[6px] mobile:gap-[4px] w-full overflow-x-auto scrollbar scrollbar-thumb-tableBorder scrollbar-track-secondary mobile:scrollbar-none',
             locked && 'opacity-50 pointer-events-none'
           )}
         >
-          <div
-            onClick={() => {
-              setHide(true);
-              setCurrent('global');
-            }}
-            className={clsx(
-              'cursor-pointer flex gap-[8px] rounded-[8px] w-[40px] h-[40px] justify-center items-center bg-newBgLineColor',
-              current !== 'global'
-                ? 'text-[#A3A3A3]'
-                : 'border border-[#FC69FF] text-[#FC69FF]'
-            )}
-          >
-            <div>
-              <GlobalIcon />
+          {/* an existing post opens on its channels, without the global mode */}
+          {!existingData.integration && (
+            <div
+              onClick={() => {
+                setHide(true);
+                setCurrent('global');
+              }}
+              className={clsx(
+                'cursor-pointer flex gap-[8px] rounded-[8px] w-[40px] h-[40px] mobile:w-[44px] mobile:h-[44px] mobile:shrink-0 justify-center items-center bg-newBgLineColor mobile:bg-newSettings',
+                current !== 'global'
+                  ? 'text-[#A3A3A3]'
+                  : 'border mobile:border-[1.5px] border-[#FC69FF] text-[#FC69FF]'
+              )}
+            >
+              <div>
+                <GlobalIcon className="mobile:w-[24px] mobile:h-[24px]" />
+              </div>
             </div>
-          </div>
+          )}
           {selectedIntegrations.map(({ integration }) => (
             <div
               onClick={() => {
@@ -99,24 +131,43 @@ export const SelectCurrent: FC = () => {
               }}
               key={integration.id}
               className={clsx(
-                'border cursor-pointer relative flex gap-[8px] w-[40px] h-[40px] rounded-[8px] items-center bg-newBgLineColor justify-center',
+                'border mobile:border-[1.5px] cursor-pointer relative flex gap-[8px] w-[40px] h-[40px] mobile:w-[44px] mobile:h-[44px] mobile:shrink-0 rounded-[8px] items-center bg-newBgLineColor mobile:bg-newSettings justify-center',
                 current === integration.id
                   ? 'border-[#FC69FF] text-[#FC69FF]'
                   : 'border-transparent'
               )}
             >
-              <IsGlobal id={integration.id} />
+              {/* an existing post keeps its channels, each with its own content */}
+              {!existingData.integration && (
+                <>
+                  <div
+                    onClick={removeSocial(integration)}
+                    className="absolute justify-center items-center flex mobile:hidden w-[8px] h-[8px] -top-[1px] -start-[3px] bg-red-500 rounded-full text-white text-[8px]"
+                  >
+                    X
+                  </div>
+                  <IsGlobal id={integration.id} />
+                </>
+              )}
               <div
+                {...{
+                  'data-tooltip-id': 'tooltip',
+                  'data-tooltip-content': integration.name,
+                }}
                 className={clsx(
                   'relative w-full h-full rounded-full flex justify-center items-center filter transition-all duration-500'
                 )}
               >
-                <Image
+                <SafeImage
                   src={integration.picture || '/no-picture.jpg'}
                   className="rounded-full min-w-[26px]"
                   alt={integration.identifier}
                   width={26}
                   height={26}
+                  onError={(e) => {
+                    e.currentTarget.src = '/no-picture.jpg';
+                    e.currentTarget.srcset = '/no-picture.jpg';
+                  }}
                 />
                 {integration.identifier === 'youtube' ? (
                   <img
@@ -125,7 +176,7 @@ export const SelectCurrent: FC = () => {
                     width={12}
                   />
                 ) : (
-                  <Image
+                  <SafeImage
                     src={`/icons/platforms/${integration.identifier}.png`}
                     className="min-w-[12px] min-h-[12px] rounded-[3px] absolute z-10 bottom-[6px] end-[6px]"
                     alt={integration.identifier}
@@ -138,18 +189,20 @@ export const SelectCurrent: FC = () => {
           ))}
         </div>
       </div>
-      <div className={clsx(hasScroll ? 'h-[55px]' : 'h-[40px]')} />
+      <div
+        className={clsx(hasScroll ? 'h-[55px]' : 'h-[40px]', 'mobile:hidden')}
+      />
     </>
   );
 };
 
 export const IsGlobal: FC<{ id: string }> = ({ id }) => {
-  const { isInternal } =
-    useLaunchStore(
-      useShallow((state) => ({
-        isInternal: !!state.internal.find(p => p.integration.id === id),
-      }))
-    );
+  const t = useT();
+  const { isInternal } = useLaunchStore(
+    useShallow((state) => ({
+      isInternal: !!state.internal.find((p) => p.integration.id === id),
+    }))
+  );
 
   if (!isInternal) {
     return null;
@@ -158,7 +211,10 @@ export const IsGlobal: FC<{ id: string }> = ({ id }) => {
   return (
     <div
       data-tooltip-id="tooltip"
-      data-tooltip-content="No longer in global mode"
+      data-tooltip-content={t(
+        'no_longer_global_mode',
+        'No longer in global mode'
+      )}
       className="w-[8px] h-[8px] bg-[#FC69FF] -top-[1px] -end-[3px] absolute rounded-full"
     />
   );

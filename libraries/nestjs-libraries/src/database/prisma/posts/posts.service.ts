@@ -1,45 +1,63 @@
 import {
   BadRequestException,
-  ForbiddenException,
   Injectable,
+  NotFoundException,
   ValidationPipe,
 } from '@nestjs/common';
 import { PostsRepository } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
 import { CreatePostDto } from '@gitroom/nestjs-libraries/dtos/posts/create.post.dto';
 import dayjs from 'dayjs';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
-import { Integration, Post, Media, From } from '@prisma/client';
+import {
+  Integration,
+  Post,
+  Media,
+  From,
+  CreationMethod,
+  State,
+} from '@prisma/client';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
-import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
-import { capitalize, shuffle, uniq } from 'lodash';
-import { MessagesService } from '@gitroom/nestjs-libraries/database/prisma/marketplace/messages.service';
-import { StripeService } from '@gitroom/nestjs-libraries/services/stripe.service';
+import { GetPostsListDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.list.dto';
+import { groupBy, shuffle, uniqBy } from 'lodash';
+import { v4 as uuidv4 } from 'uuid';
 import { CreateGeneratedPostsDto } from '@gitroom/nestjs-libraries/dtos/generator/create.generated.posts.dto';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
-import {
-  BadBody,
-  RefreshToken,
-} from '@gitroom/nestjs-libraries/integrations/social.abstract';
-import { BullMqClient } from '@gitroom/nestjs-libraries/bull-mq-transport-new/client';
-import { timer } from '@gitroom/helpers/utils/timer';
-import { AuthTokenDetails } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import utc from 'dayjs/plugin/utc';
 import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
 import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
-import { WebhooksService } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.service';
 import { CreateTagDto } from '@gitroom/nestjs-libraries/dtos/posts/create.tag.dto';
-import axios from 'axios';
+import {
+  minifyPostsList,
+  minifyPosts,
+} from '@gitroom/helpers/utils/posts.list.minify';
+import { getSsrfSafeAxios } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import sharp from 'sharp';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { Readable } from 'stream';
+import { resolve, sep } from 'path';
 import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
-import { plainToInstance } from 'class-transformer';
-import { validate } from 'class-validator';
-import { stripHtmlValidation } from '@gitroom/helpers/utils/strip.html.validation';
 dayjs.extend(utc);
 import * as Sentry from '@sentry/nestjs';
+import { TemporalService } from 'nestjs-temporal-core';
+import { TypedSearchAttributes } from '@temporalio/common';
+import {
+  organizationId,
+  postId as postIdSearchParam,
+} from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
+import { AnalyticsData } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+import { timer } from '@gitroom/helpers/utils/timer';
+import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+import { RefreshToken } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
+import { hasExtension } from '@gitroom/helpers/utils/has.extension';
+import { stripLinks } from '@gitroom/helpers/utils/strip.links';
+import { validate } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
+import { stripHtmlValidation } from '@gitroom/helpers/utils/strip.html.validation';
+import { postContentPlainText } from '@gitroom/helpers/utils/sanitize.post.content';
+import { CreatePublicCommentDto } from '@gitroom/nestjs-libraries/dtos/comments/add.comment.dto';
+import { countLength } from '@gitroom/helpers/utils/count.length';
 
 type PostWithConditionals = Post & {
   integration?: Integration;
@@ -51,24 +69,329 @@ export class PostsService {
   private storage = UploadFactory.createStorage();
   constructor(
     private _postRepository: PostsRepository,
-    private _workerServiceProducer: BullMqClient,
     private _integrationManager: IntegrationManager,
-    private _notificationService: NotificationService,
-    private _messagesService: MessagesService,
-    private _stripeService: StripeService,
     private _integrationService: IntegrationService,
     private _mediaService: MediaService,
     private _shortLinkService: ShortLinkService,
-    private _webhookService: WebhooksService,
-    private openaiService: OpenaiService,
+    private _openaiService: OpenaiService,
+    private _temporalService: TemporalService,
     private _refreshIntegrationService: RefreshIntegrationService
   ) {}
 
-  checkPending15minutesBack() {
-    return this._postRepository.checkPending15minutesBack();
-  }
   searchForMissingThreeHoursPosts() {
     return this._postRepository.searchForMissingThreeHoursPosts();
+  }
+
+  updatePost(id: string, postId: string, releaseURL: string) {
+    return this._postRepository.updatePost(id, postId, releaseURL);
+  }
+
+  updateResolvedRelease(
+    id: string,
+    orgId: string,
+    releaseId: string,
+    releaseURL: string
+  ) {
+    return this._postRepository.updateResolvedRelease(
+      id,
+      orgId,
+      releaseId,
+      releaseURL
+    );
+  }
+
+  async getMissingContent(
+    orgId: string,
+    postId: string,
+    forceRefresh = false
+  ): Promise<{ id: string; url: string }[]> {
+    const post = await this._postRepository.getPostById(postId, orgId);
+    if (!post || post.releaseId !== 'missing') {
+      return [];
+    }
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      post.integration.providerIdentifier
+    );
+
+    if (!integrationProvider.missing) {
+      return [];
+    }
+
+    const getIntegration = post.integration!;
+
+    if (
+      dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) ||
+      forceRefresh
+    ) {
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+      if (!data) {
+        return [];
+      }
+
+      const { accessToken } = data;
+
+      if (accessToken) {
+        getIntegration.token = accessToken;
+
+        if (integrationProvider.refreshWait) {
+          await timer(10000);
+        }
+      } else {
+        await this._integrationService.disconnectChannel(orgId, getIntegration);
+        return [];
+      }
+    }
+
+    try {
+      return await integrationProvider.missing(
+        getIntegration.internalId,
+        getIntegration.token
+      );
+    } catch (e) {
+      console.log(e);
+      if (e instanceof RefreshToken) {
+        return this.getMissingContent(orgId, postId, true);
+      }
+    }
+
+    return [];
+  }
+
+  async getPostById(postId: string, orgId: string) {
+    return this._postRepository.getPostById(postId, orgId);
+  }
+
+  async getPostTimeline(postId: string, orgId: string) {
+    return this._postRepository.getPostTimeline(postId, orgId);
+  }
+
+  async updateReleaseId(orgId: string, postId: string, releaseId: string) {
+    const post = await this._postRepository.getPostById(postId, orgId);
+
+    // the URL is a bonus: connecting must not fail when it cannot be fetched
+    let releaseURL: string | undefined;
+    if (post?.releaseId === 'missing') {
+      try {
+        releaseURL = await this._integrationManager
+          .getSocialIntegration(post.integration.providerIdentifier)
+          .releaseUrl?.(
+            post.integration.token,
+            String(releaseId),
+            post.integration
+          );
+      } catch (e) {
+        console.log(e);
+      }
+    }
+
+    return this._postRepository.updateReleaseId(
+      postId,
+      orgId,
+      releaseId,
+      releaseURL
+    );
+  }
+
+  async resolveRelease(
+    orgId: string,
+    post: {
+      id: string;
+      releaseId: string;
+      releaseURL: string;
+      settings: string;
+      integration: Integration;
+    }
+  ) {
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      post.integration.providerIdentifier
+    );
+
+    const resolved = await integrationProvider.resolveReleaseId?.(
+      post.integration.token,
+      post.releaseId,
+      post.integration,
+      JSON.parse(post.settings || '{}'),
+      post.releaseURL
+    );
+    if (
+      !resolved ||
+      !('postId' in resolved) ||
+      resolved.postId === post.releaseId
+    ) {
+      return {
+        releaseId: post.releaseId,
+        releaseURL: post.releaseURL,
+        pending: !!resolved && 'pending' in resolved,
+        unavailable: !!resolved && 'unavailable' in resolved,
+      };
+    }
+
+    await this._postRepository.updateResolvedRelease(
+      post.id,
+      orgId,
+      resolved.postId,
+      resolved.releaseURL
+    );
+    return {
+      releaseId: resolved.postId,
+      releaseURL: resolved.releaseURL,
+      pending: false,
+      unavailable: false,
+    };
+  }
+
+  async getReleaseURL(
+    orgId: string,
+    postId: string,
+    forceRefresh = false
+  ): Promise<{
+    releaseURL: string;
+    pending?: boolean;
+    unavailable?: boolean;
+    reconnect?: boolean;
+  }> {
+    const post = await this._postRepository.getPostById(postId, orgId);
+    if (!post || !post.releaseURL) {
+      return { releaseURL: '' };
+    }
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      post.integration.providerIdentifier
+    );
+
+    if (!integrationProvider.resolveReleaseId) {
+      return { releaseURL: post.releaseURL };
+    }
+
+    const getIntegration = post.integration!;
+
+    // only refreshed once the platform rejects the token, so a post that is
+    // already resolved never reaches the platform
+    if (forceRefresh) {
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+      if (!data) {
+        return { releaseURL: post.releaseURL, reconnect: true };
+      }
+
+      const { accessToken } = data;
+
+      if (accessToken) {
+        getIntegration.token = accessToken;
+
+        if (integrationProvider.refreshWait) {
+          await timer(10000);
+        }
+      } else {
+        await this._integrationService.disconnectChannel(orgId, getIntegration);
+        return { releaseURL: post.releaseURL, reconnect: true };
+      }
+    }
+
+    try {
+      const { releaseURL, pending, unavailable } = await this.resolveRelease(
+        orgId,
+        post
+      );
+      return { releaseURL, pending, unavailable };
+    } catch (e) {
+      console.log(e);
+      if (e instanceof RefreshToken && !forceRefresh) {
+        return this.getReleaseURL(orgId, postId, true);
+      }
+    }
+
+    return { releaseURL: post.releaseURL, pending: true };
+  }
+
+  async checkPostAnalytics(
+    orgId: string,
+    postId: string,
+    date: number,
+    forceRefresh = false
+  ): Promise<AnalyticsData[] | { missing: true }> {
+    const post = await this._postRepository.getPostById(postId, orgId);
+    if (!post || !post.releaseId) {
+      return [];
+    }
+
+    if (post.releaseId === 'missing') {
+      return { missing: true };
+    }
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      post.integration.providerIdentifier
+    );
+
+    if (!integrationProvider.postAnalytics) {
+      return [];
+    }
+
+    const getIntegration = post.integration!;
+
+    if (
+      dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) ||
+      forceRefresh
+    ) {
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+      if (!data) {
+        return [];
+      }
+
+      const { accessToken } = data;
+
+      if (accessToken) {
+        getIntegration.token = accessToken;
+
+        if (integrationProvider.refreshWait) {
+          await timer(10000);
+        }
+      } else {
+        await this._integrationService.disconnectChannel(orgId, getIntegration);
+        return [];
+      }
+    }
+
+    // const getIntegrationData = await ioRedis.get(
+    //   `integration:${orgId}:${post.id}:${date}`
+    // );
+    // if (getIntegrationData) {
+    //   return JSON.parse(getIntegrationData);
+    // }
+
+    try {
+      const { releaseId } = await this.resolveRelease(orgId, post);
+
+      const loadAnalytics = await integrationProvider.postAnalytics(
+        getIntegration.internalId,
+        getIntegration.token,
+        releaseId,
+        date
+      );
+      await ioRedis.set(
+        `integration:${orgId}:${post.id}:${date}`,
+        JSON.stringify(loadAnalytics),
+        'EX',
+        !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
+          ? 1
+          : 3600
+      );
+      return loadAnalytics;
+    } catch (e) {
+      // Retry once with a refreshed token
+      if (e instanceof RefreshToken && !forceRefresh) {
+        return this.checkPostAnalytics(orgId, postId, date, true);
+      }
+      console.log(e);
+    }
+
+    return [];
   }
 
   async getStatistics(orgId: string, id: string) {
@@ -94,9 +417,9 @@ export class PostsService {
 
     const mappedValues = {
       ...body,
-      type: replaceDraft ? 'schedule' : body.type,
+      type: replaceDraft ? 'schedule' : body?.type,
       posts: await Promise.all(
-        body.posts.map(async (post) => {
+        body?.posts?.map(async (post) => {
           const integration = await this._integrationService.getIntegrationById(
             organization,
             post.integration.id
@@ -109,13 +432,14 @@ export class PostsService {
           }
 
           return {
+            type: replaceDraft ? 'schedule' : body?.type,
             ...post,
             settings: {
               ...(post.settings || ({} as any)),
               __type: integration.providerIdentifier,
             },
           };
-        })
+        }) || []
       ),
     };
 
@@ -167,6 +491,18 @@ export class PostsService {
     return this._postRepository.getPosts(orgId, query);
   }
 
+  async getPostsMinified(orgId: string, query: GetPostsDto) {
+    return minifyPosts({
+      posts: await this._postRepository.getPosts(orgId, query),
+    });
+  }
+
+  async getPostsList(orgId: string, query: GetPostsListDto) {
+    return minifyPostsList(
+      await this._postRepository.getPostsList(orgId, query)
+    );
+  }
+
   async updateMedia(id: string, imagesList: any[], convertToJPEG = false) {
     try {
       let imageUpdateNeeded = false;
@@ -174,15 +510,28 @@ export class PostsService {
         (
           await Promise.all(
             (imagesList || []).map(async (p: any) => {
-              if (!p.path && p.id) {
+              if (!p.id) {
+                return p;
+              }
+
+              if (!p.path) {
                 imageUpdateNeeded = true;
                 return this._mediaService.getMediaById(p.id);
+              }
+
+              // the normalizer may have replaced the file after the post was
+              // composed; a record still processing publishes the original
+              const fresh = await this._mediaService.getMediaById(p.id);
+              if (fresh?.status === 'ready' && fresh.path !== p.path) {
+                imageUpdateNeeded = true;
+                return { ...p, name: fresh.name, path: fresh.path };
               }
 
               return p;
             })
           )
         )
+          .filter((m) => this.isAllowedMediaPath(m?.path))
           .map((m) => {
             return {
               ...m,
@@ -205,9 +554,11 @@ export class PostsService {
               return m;
             }
 
-            if (m.path.indexOf('.png') > -1) {
+            if (hasExtension(m.path, 'png')) {
               imageUpdateNeeded = true;
-              const response = await axios.get(m.url, {
+              // the media url is user-influenced, so it goes through the same
+              // SSRF-safe client as the providers' media reads
+              const response = await getSsrfSafeAxios().get(m.url, {
                 responseType: 'arraybuffer',
               });
 
@@ -262,17 +613,135 @@ export class PostsService {
 
       return getImageList;
     } catch (err: any) {
-      return imagesList;
+      return (imagesList || []).filter((m) =>
+        this.isAllowedMediaPath(m?.path)
+      );
     }
   }
 
-  async getPost(orgId: string, id: string, convertToJPEG = false) {
-    const posts = await this.getPostsRecursively(id, true, orgId, true);
-    const list = {
+  // a media path that isn't a remote url is read straight from the worker's
+  // disk, so it has to resolve inside UPLOAD_DIRECTORY
+  private isAllowedMediaPath(path: unknown) {
+    if (typeof path !== 'string' || /^https?:\/\//.test(path)) {
+      return true;
+    }
+
+    // containing "http" anywhere skips the UPLOAD_DIRECTORY prefix, and the
+    // providers would then read it relative to the working directory
+    if (path.indexOf('http') > -1) {
+      return false;
+    }
+
+    const base = resolve(String(process.env.UPLOAD_DIRECTORY));
+    const filePath = resolve(process.env.UPLOAD_DIRECTORY + path);
+    return filePath.startsWith(base + sep);
+  }
+
+  async getPostGroupDebugExport(orgId: string, group: string) {
+    const loadAll = await this._postRepository.getPostsByGroup(orgId, group);
+    const errors = await this._postRepository.getErrorsByPostIds(
+      loadAll.map((p) => p.id)
+    );
+    const posts = this.arrangePostsByGroup(loadAll, undefined);
+    const rootPost = posts[0] as any;
+
+    return {
+      type: 'draft' as const,
+      shortLink: false,
+      date: rootPost.publishDate.toISOString(),
+      tags:
+        rootPost.tags?.map((t: any) => ({
+          value: t.tag.id,
+          label: t.tag.name,
+        })) || [],
+      posts: [
+        {
+          integration: { id: 'REPLACE_WITH_LOCAL_INTEGRATION_ID' },
+          group: rootPost.group,
+          settings: JSON.parse(rootPost.settings || '{}'),
+          value: posts.map((post) => ({
+            content: post.content,
+            image: JSON.parse(post.image || '[]'),
+            delay: post.delay || 0,
+          })),
+        },
+      ],
+      _debug: {
+        providerIdentifier: rootPost.integration?.providerIdentifier,
+        providerName: rootPost.integration?.name,
+        state: rootPost.state,
+        error: rootPost.error,
+        errors: errors.map((e) => ({
+          message: e.message,
+          platform: e.platform,
+          body: e.body,
+          createdAt: e.createdAt,
+        })),
+        originalGroup: group,
+        originalPublishDate: rootPost.publishDate,
+        exportedAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  async getPostsByGroup(orgId: string, group: string) {
+    const loadAll = await this._postRepository.getPostsByGroup(orgId, group);
+    const posts = this.arrangePostsByGroup(loadAll, undefined);
+    if (!posts.length) {
+      throw new NotFoundException('Post not found');
+    }
+
+    const batch = posts[0].batchId
+      ? await this._postRepository.getPostsByBatch(
+          orgId,
+          posts[0].batchId,
+          group
+        )
+      : [];
+
+    // the other channels the post was created with, the editor holds one
+    // post per channel, and a channel that repeats differently is its own post
+    const siblings = uniqBy(
+      Object.values(groupBy(batch, (post) => post.group))
+        .map((batchPosts) => this.arrangePostsByGroup(batchPosts, undefined))
+        .filter(
+          (batchPosts) =>
+            batchPosts.length &&
+            batchPosts[0].integrationId !== posts[0].integrationId &&
+            batchPosts[0].intervalInDays === posts[0].intervalInDays
+        ),
+      (batchPosts) => batchPosts[0].integrationId
+    );
+
+    return {
+      ...(await this.groupForEditor(posts)),
+      siblings: await Promise.all(
+        siblings.map((batchPosts) => this.groupForEditor(batchPosts))
+      ),
+    };
+  }
+
+  // the post as the editor loads it, its channel without the tokens
+  private async groupForEditor(
+    posts: PostWithConditionals[],
+    convertToJPEG = false
+  ) {
+    return {
       group: posts?.[0]?.group,
       posts: await Promise.all(
-        (posts || []).map(async (post) => ({
+        (posts || []).map(async ({ integration, ...post }) => ({
           ...post,
+          ...(integration
+            ? {
+                integration: {
+                  id: integration.id,
+                  name: integration.name,
+                  picture: integration.picture,
+                  providerIdentifier: integration.providerIdentifier,
+                  profile: integration.profile,
+                },
+              }
+            : {}),
           image: await this.updateMedia(
             post.id,
             JSON.parse(post.image || '[]'),
@@ -284,110 +753,40 @@ export class PostsService {
       integration: posts[0].integrationId,
       settings: JSON.parse(posts[0].settings || '{}'),
     };
+  }
 
-    return list;
+  arrangePostsByGroup(all: any, parent?: string): PostWithConditionals[] {
+    const findAll = all
+      .filter((p: any) =>
+        !parent ? !p.parentPostId : p.parentPostId === parent
+      )
+      .map(({ integration, ...all }: any) => ({
+        ...all,
+        ...(!parent ? { integration } : {}),
+      }));
+
+    return [
+      ...findAll,
+      ...(findAll.length
+        ? findAll.flatMap((p: any) => this.arrangePostsByGroup(all, p.id))
+        : []),
+    ];
+  }
+
+  async getPost(orgId: string, id: string, convertToJPEG = false) {
+    const posts = await this.getPostsRecursively(id, true, orgId, true);
+    if (!posts?.[0]) {
+      throw new NotFoundException('Post not found');
+    }
+
+    return this.groupForEditor(posts, convertToJPEG);
   }
 
   async getOldPosts(orgId: string, date: string) {
     return this._postRepository.getOldPosts(orgId, date);
   }
 
-  async post(id: string) {
-    const allPosts = await this.getPostsRecursively(id, true);
-    const [firstPost, ...morePosts] = allPosts;
-    if (!firstPost) {
-      return;
-    }
-
-    if (firstPost.integration?.refreshNeeded) {
-      await this._notificationService.inAppNotification(
-        firstPost.organizationId,
-        `We couldn't post to ${firstPost.integration?.providerIdentifier} for ${firstPost?.integration?.name}`,
-        `We couldn't post to ${firstPost.integration?.providerIdentifier} for ${firstPost?.integration?.name} because you need to reconnect it. Please enable it and try again.`,
-        true,
-        false,
-        'info'
-      );
-      return;
-    }
-
-    if (firstPost.integration?.disabled) {
-      await this._notificationService.inAppNotification(
-        firstPost.organizationId,
-        `We couldn't post to ${firstPost.integration?.providerIdentifier} for ${firstPost?.integration?.name}`,
-        `We couldn't post to ${firstPost.integration?.providerIdentifier} for ${firstPost?.integration?.name} because it's disabled. Please enable it and try again.`,
-        true,
-        false,
-        'info'
-      );
-      return;
-    }
-
-    try {
-      const finalPost = await this.postSocial(firstPost.integration!, [
-        firstPost,
-        ...morePosts,
-      ]);
-
-      if (firstPost?.intervalInDays) {
-        this._workerServiceProducer.emit('post', {
-          id,
-          options: {
-            delay: firstPost.intervalInDays * 86400000,
-          },
-          payload: {
-            id: id,
-          },
-        });
-      }
-
-      if (!finalPost?.postId || !finalPost?.releaseURL) {
-        await this._postRepository.changeState(firstPost.id, 'ERROR');
-        await this._notificationService.inAppNotification(
-          firstPost.organizationId,
-          `Error posting on ${firstPost.integration?.providerIdentifier} for ${firstPost?.integration?.name}`,
-          `An error occurred while posting on ${firstPost.integration?.providerIdentifier}`,
-          true,
-          false,
-          'fail'
-        );
-
-        return;
-      }
-    } catch (err: any) {
-      await this._postRepository.changeState(
-        firstPost.id,
-        'ERROR',
-        err,
-        allPosts
-      );
-      if (err instanceof BadBody) {
-        await this._notificationService.inAppNotification(
-          firstPost.organizationId,
-          `Error posting on ${firstPost.integration?.providerIdentifier} for ${firstPost?.integration?.name}`,
-          `An error occurred while posting on ${
-            firstPost.integration?.providerIdentifier
-          }${err?.message ? `: ${err?.message}` : ``}`,
-          true,
-          false,
-          'fail'
-        );
-
-        console.error(
-          '[Error] posting on',
-          firstPost.integration?.providerIdentifier,
-          err.identifier,
-          err.json,
-          err.body,
-          err
-        );
-      }
-
-      return;
-    }
-  }
-
-  private async updateTags(orgId: string, post: Post[]): Promise<Post[]> {
+  public async updateTags(orgId: string, post: Post[]): Promise<Post[]> {
     const plainText = JSON.stringify(post);
     const extract = Array.from(
       plainText.match(/\(post:[a-zA-Z0-9-_]+\)/g) || []
@@ -400,138 +799,27 @@ export class PostsService {
       e.replace('(post:', '').replace(')', '')
     );
     const urls = await this._postRepository.getPostUrls(orgId, ids);
-    const newPlainText = ids.reduce((acc, value) => {
-      const findUrl = urls?.find?.((u) => u.id === value)?.releaseURL || '';
-      return acc.replace(
-        new RegExp(`\\(post:${value}\\)`, 'g'),
-        findUrl.split(',')[0]
-      );
-    }, plainText);
+    const replaceTags = (text: string, escape = (url: string) => url) =>
+      ids.reduce((acc, value) => {
+        const findUrl = urls?.find?.((u) => u.id === value)?.releaseURL || '';
+        return acc.replace(new RegExp(`\\(post:${value}\\)`, 'g'), () =>
+          escape(findUrl.split(',')[0])
+        );
+      }, text);
 
-    return this.updateTags(orgId, JSON.parse(newPlainText) as Post[]);
+    // the release url is whatever the platform answered, so it only goes where
+    // a tag is written, the content and the settings (escaped for their json),
+    // and never into the media list, which was validated before this runs
+    return post.map((p) => ({
+      ...p,
+      content: p.content && replaceTags(p.content),
+      settings:
+        p.settings &&
+        replaceTags(p.settings, (url) => JSON.stringify(url).slice(1, -1)),
+    }));
   }
 
-  private async postSocial(
-    integration: Integration,
-    posts: Post[],
-    forceRefresh = false
-  ): Promise<Partial<{ postId: string; releaseURL: string }> | undefined> {
-    const getIntegration = this._integrationManager.getSocialIntegration(
-      integration.providerIdentifier
-    );
-
-    if (!getIntegration) {
-      return {};
-    }
-
-    if (dayjs(integration?.tokenExpiration).isBefore(dayjs()) || forceRefresh) {
-      const data = await this._refreshIntegrationService.refresh(integration);
-
-      if (!data) {
-        return undefined;
-      }
-
-      integration.token = data.accessToken;
-
-      if (getIntegration.refreshWait) {
-        await timer(10000);
-      }
-    }
-
-    const newPosts = await this.updateTags(integration.organizationId, posts);
-
-    try {
-      const publishedPosts = await getIntegration.post(
-        integration.internalId,
-        integration.token,
-        await Promise.all(
-          (newPosts || []).map(async (p) => ({
-            id: p.id,
-            message: stripHtmlValidation(
-              getIntegration.editor,
-              p.content,
-              true,
-              false,
-              !/<\/?[a-z][\s\S]*>/i.test(p.content),
-              getIntegration.mentionFormat
-            ),
-            settings: JSON.parse(p.settings || '{}'),
-            media: await this.updateMedia(
-              p.id,
-              JSON.parse(p.image || '[]'),
-              getIntegration?.convertToJPEG || false
-            ),
-          }))
-        ),
-        integration
-      );
-
-      for (const post of publishedPosts) {
-        try {
-          await this._postRepository.updatePost(
-            post.id,
-            post.postId,
-            post.releaseURL
-          );
-        } catch (err) {}
-      }
-
-      try {
-        await this._notificationService.inAppNotification(
-          integration.organizationId,
-          `Your post has been published on ${capitalize(
-            integration.providerIdentifier
-          )}`,
-          `Your post has been published on ${capitalize(
-            integration.providerIdentifier
-          )} at ${publishedPosts[0].releaseURL}`,
-          true,
-          true
-        );
-
-        await this._webhookService.digestWebhooks(
-          integration.organizationId,
-          dayjs(newPosts[0].publishDate).format('YYYY-MM-DDTHH:mm:00')
-        );
-
-        await this.checkPlugs(
-          integration.organizationId,
-          getIntegration.identifier,
-          integration.id,
-          publishedPosts[0].postId
-        );
-
-        await this.checkInternalPlug(
-          integration,
-          integration.organizationId,
-          publishedPosts[0].postId,
-          JSON.parse(newPosts[0].settings || '{}')
-        );
-      } catch (err) {}
-
-      return {
-        postId: publishedPosts[0].postId,
-        releaseURL: publishedPosts[0].releaseURL,
-      };
-    } catch (err) {
-      if (err instanceof RefreshToken) {
-        return this.postSocial(integration, posts, true);
-      }
-
-      if (err instanceof BadBody) {
-        throw err;
-      }
-
-      throw new BadBody(
-        integration.providerIdentifier,
-        JSON.stringify(err),
-        {} as any,
-        ''
-      );
-    }
-  }
-
-  private async checkInternalPlug(
+  public async checkInternalPlug(
     integration: Integration,
     orgId: string,
     id: string,
@@ -542,7 +830,7 @@ export class PostsService {
     });
 
     if (plugs.length === 0) {
-      return;
+      return [];
     }
 
     const parsePlugs = plugs.reduce((all, [key, value]) => {
@@ -559,32 +847,24 @@ export class PostsService {
       active: boolean;
     }[] = Object.values(parsePlugs);
 
-    for (const trigger of list || []) {
-      for (const int of trigger?.integrations || []) {
-        this._workerServiceProducer.emit('internal-plugs', {
-          id: 'plug_' + id + '_' + trigger.name + '_' + int.id,
-          options: {
-            delay: +trigger.delay,
-          },
-          payload: {
-            post: id,
-            originalIntegration: integration.id,
-            integration: int.id,
-            plugName: trigger.name,
-            orgId: orgId,
-            delay: +trigger.delay,
-            information: trigger,
-          },
-        });
-      }
-    }
+    return (list || []).flatMap((trigger) => {
+      return (trigger?.integrations || []).flatMap((int) => ({
+        type: 'internal-plug',
+        post: id,
+        originalIntegration: integration.id,
+        integration: int.id,
+        plugName: trigger.name,
+        orgId: orgId,
+        delay: +trigger.delay,
+        information: trigger,
+      }));
+    });
   }
 
-  private async checkPlugs(
+  public async checkPlugs(
     orgId: string,
     providerName: string,
-    integrationId: string,
-    postId: string
+    integrationId: string
   ) {
     const loadAllPlugs = this._integrationManager.getAllPlugs();
     const getPlugs = await this._integrationService.getPlugs(
@@ -594,34 +874,52 @@ export class PostsService {
 
     const currentPlug = loadAllPlugs.find((p) => p.identifier === providerName);
 
-    for (const plug of getPlugs) {
-      const runPlug = currentPlug?.plugs?.find(
-        (p: any) => p.methodName === plug.plugFunction
-      )!;
-      if (!runPlug) {
-        continue;
-      }
-
-      this._workerServiceProducer.emit('plugs', {
-        id: 'plug_' + postId + '_' + runPlug.identifier,
-        options: {
-          delay: runPlug.runEveryMilliseconds,
-        },
-        payload: {
+    return getPlugs
+      .filter((plug) => {
+        return currentPlug?.plugs?.some(
+          (p: any) => p.methodName === plug.plugFunction
+        );
+      })
+      .map((plug) => {
+        const runPlug = currentPlug?.plugs?.find(
+          (p: any) => p.methodName === plug.plugFunction
+        )!;
+        return {
+          type: 'global',
           plugId: plug.id,
-          postId,
           delay: runPlug.runEveryMilliseconds,
           totalRuns: runPlug.totalRuns,
-          currentRun: 1,
-        },
+        };
       });
-    }
   }
 
   async deletePost(orgId: string, group: string) {
     const post = await this._postRepository.deletePost(orgId, group);
+
     if (post?.id) {
-      await this._workerServiceProducer.delete('post', post.id);
+      try {
+        const workflows = this._temporalService.client
+          .getRawClient()
+          ?.workflow.list({
+            query: `postId="${post.id}" AND ExecutionStatus="Running"`,
+          });
+
+        for await (const executionInfo of workflows) {
+          try {
+            const workflow =
+              await this._temporalService.client.getWorkflowHandle(
+                executionInfo.workflowId
+              );
+            if (
+              workflow &&
+              (await workflow.describe()).status.name !== 'TERMINATED'
+            ) {
+              await workflow.terminate();
+            }
+          } catch (err) {}
+        }
+      } catch (err) {}
+
       return { id: post.id };
     }
 
@@ -632,60 +930,290 @@ export class PostsService {
     return this._postRepository.countPostsFromDay(orgId, date);
   }
 
-  async createPost(orgId: string, body: CreatePostDto): Promise<any[]> {
+  getPostByForWebhookId(id: string, integrationId: string) {
+    return this._postRepository.getPostByForWebhookId(id, integrationId);
+  }
+
+  async startWorkflow(
+    taskQueue: string,
+    postId: string,
+    orgId: string,
+    state: State
+  ) {
+    try {
+      const workflows = this._temporalService.client
+        .getRawClient()
+        ?.workflow.list({
+          query: `postId="${postId}" AND ExecutionStatus="Running"`,
+        });
+
+      for await (const executionInfo of workflows) {
+        try {
+          const workflow = await this._temporalService.client.getWorkflowHandle(
+            executionInfo.workflowId
+          );
+          if (
+            workflow &&
+            (await workflow.describe()).status.name !== 'TERMINATED'
+          ) {
+            await workflow.terminate();
+          }
+        } catch (err) {}
+      }
+    } catch (err) {}
+
+    if (state === 'DRAFT') {
+      return;
+    }
+
+    try {
+      await this._temporalService.client
+        .getRawClient()
+        ?.workflow.start('postWorkflowV112', {
+          workflowId: `post_${postId}`,
+          taskQueue: 'main',
+          workflowIdConflictPolicy: 'TERMINATE_EXISTING',
+          args: [
+            {
+              taskQueue: taskQueue,
+              postId: postId,
+              organizationId: orgId,
+            },
+          ],
+          typedSearchAttributes: new TypedSearchAttributes([
+            {
+              key: postIdSearchParam,
+              value: postId,
+            },
+            {
+              key: organizationId,
+              value: orgId,
+            },
+          ]),
+        });
+    } catch (err) {}
+  }
+
+  /**
+   * Server-side validation that used to live on the client (`checkValidity` +
+   * the manage modal loop). Runs the provider's settings DTO validation, the
+   * provider `checkValidity` (media rules) and the empty-content / too-long
+   * character checks. Returns one result per post so the frontend can show the
+   * same toasts it did before — and so `/posts` can refuse to create invalid
+   * posts.
+   */
+  async validatePosts(
+    orgId: string,
+    posts: Array<{
+      integration: { id: string };
+      value: Array<{
+        content?: string;
+        image?: Array<{ path: string; thumbnail?: string }>;
+      }>;
+      settings?: any;
+    }>
+  ) {
+    return Promise.all(
+      (posts || []).map(async (post) => {
+        const integration = await this._integrationService.getIntegrationById(
+          orgId,
+          post?.integration?.id
+        );
+
+        if (!integration) {
+          throw new BadRequestException(
+            `Integration with id ${post?.integration?.id} not found`
+          );
+        }
+
+        const provider = this._integrationManager.getSocialIntegration(
+          integration.providerIdentifier
+        );
+
+        let additionalSettings: any[] = [];
+        try {
+          additionalSettings = JSON.parse(
+            integration.additionalSettings || '[]'
+          );
+        } catch {
+          additionalSettings = [];
+        }
+
+        const settings = post.settings || {};
+        const media = (post.value || []).map((p) => p.image || []);
+
+        // Settings DTO validation — mirrors the client `form.trigger()`.
+        let valid = true;
+        let settingsError = '';
+        if (provider?.dto) {
+          const instance = plainToInstance(provider.dto, settings, {
+            enableImplicitConversion: false,
+          });
+          const validationErrors = await validate(instance as object, {
+            skipMissingProperties: false,
+          });
+          settingsError = this.firstValidationError(validationErrors);
+          valid = validationErrors.length === 0;
+        }
+
+        // Provider-specific media validation (the old client `checkValidity`).
+        let errors: string | true = true;
+        try {
+          errors = await provider.checkValidity(
+            media,
+            settings,
+            additionalSettings
+          );
+        } catch (err: any) {
+          errors = err?.message || 'Invalid media';
+        }
+
+        const maximumCharacters = provider.maxLength(
+          additionalSettings,
+          settings
+        );
+
+        const emptyContent = (post.value || []).some((a) => {
+          const strip = stripHtmlValidation('normal', a.content || '', true);
+          const length = countLength(integration.providerIdentifier, strip);
+          return length === 0 && (a.image || []).length === 0;
+        });
+
+        const tooLong = (post.value || []).some((a) => {
+          const strip = stripHtmlValidation('normal', a.content || '', true);
+          const counted = countLength(integration.providerIdentifier, strip);
+          return counted > (maximumCharacters || 1000000);
+        });
+
+        return {
+          id: integration.id,
+          identifier: integration.providerIdentifier,
+          name: integration.name,
+          valid,
+          settingsError,
+          errors,
+          emptyContent,
+          tooLong,
+          maximumCharacters,
+        };
+      })
+    );
+  }
+
+  /** Returns the first class-validator message (incl. nested children), or ''. */
+  private firstValidationError(errors: any[]): string {
+    for (const e of errors || []) {
+      if (e?.constraints) {
+        return Object.values(e.constraints as Record<string, string>)[0] || '';
+      }
+      const child = e?.children?.length
+        ? this.firstValidationError(e.children)
+        : '';
+      if (child) {
+        return child;
+      }
+    }
+    return '';
+  }
+
+  // A schedule-type save targeting an already-PUBLISHED post republishes it to
+  // the platform: require the explicit `republish` opt-in instead. The message
+  // doubles as the confirmation dialog for API/MCP automation.
+  private guardAgainstRepublish(
+    post: {
+      state: State;
+      publishDate: Date;
+      integration?: { providerIdentifier: string };
+    } | null,
+    source: 'createPost' | 'changeDate'
+  ) {
+    if (post?.state !== 'PUBLISHED') {
+      return;
+    }
+
+    const howToUpdate =
+      source === 'createPost' ? `use type 'update'` : `use action 'update'`;
+
+    throw new BadRequestException(
+      `This post was already published on ${dayjs
+        .utc(post.publishDate)
+        .format(
+          'YYYY-MM-DD HH:mm'
+        )} UTC. Saving it this way would publish it again to ${
+        post.integration?.providerIdentifier || 'the channel'
+      }. To edit without republishing, ${howToUpdate}. To intentionally publish again, pass republish: true.`
+    );
+  }
+
+  async createPost(
+    orgId: string,
+    body: CreatePostDto,
+    creationMethod: CreationMethod,
+    keepGroup = false
+  ): Promise<any[]> {
     const postList = [];
+    const batchId = uuidv4();
     for (const post of body.posts) {
+      if (
+        (body.type === 'schedule' || body.type === 'now') &&
+        !body.republish &&
+        post.value?.[0]?.id
+      ) {
+        this.guardAgainstRepublish(
+          await this._postRepository.getPostById(post.value[0].id, orgId),
+          'createPost'
+        );
+      }
+      const provider = this._integrationManager.getSocialIntegration(
+        (post.settings as any)?.__type
+      );
+      const removeLinks = !!provider?.stripLinks?.();
+
       const messages = (post.value || []).map((p) => p.content);
-      const updateContent = !body.shortLink
-        ? messages
-        : await this._shortLinkService.convertTextToShortLinks(orgId, messages);
+      // No point shortlinking links on platforms that strip them out anyway
+      const updateContent =
+        !body.shortLink || removeLinks
+          ? messages
+          : await this._shortLinkService.convertTextToShortLinks(
+              orgId,
+              messages
+            );
 
       post.value = (post.value || []).map((p, i) => ({
         ...p,
-        content: updateContent[i],
+        content: removeLinks ? stripLinks(updateContent[i]) : updateContent[i],
       }));
 
-      const { previousPost, posts } =
-        await this._postRepository.createOrUpdatePost(
-          body.type,
-          orgId,
-          body.type === 'now'
-            ? dayjs().format('YYYY-MM-DDTHH:mm:00')
-            : body.date,
-          post,
-          body.tags,
-          body.inter
-        );
+      const { posts } = await this._postRepository.createOrUpdatePost(
+        body.type,
+        orgId,
+        body.type === 'now'
+          ? dayjs().format('YYYY-MM-DDTHH:mm:00')
+          : post.date || body.date,
+        post,
+        body.tags,
+        creationMethod,
+        body.inter,
+        keepGroup,
+        batchId
+      );
 
       if (!posts?.length) {
         return [] as any[];
       }
 
-      await this._workerServiceProducer.delete(
-        'post',
-        previousPost ? previousPost : posts?.[0]?.id
+      const existingIds = (post.value || []).map((p) => p.id).filter(Boolean);
+      await this.detachStaleAnchors(
+        posts.filter((p) => existingIds.includes(p.id))
       );
 
-      if (
-        body.type === 'now' ||
-        (body.type === 'schedule' && dayjs(body.date).isAfter(dayjs()))
-      ) {
-        this._workerServiceProducer.emit('post', {
-          id: posts[0].id,
-          options: {
-            delay:
-              body.type === 'now'
-                ? 0
-                : dayjs(posts[0].publishDate).diff(dayjs(), 'millisecond'),
-          },
-          payload: {
-            id: posts[0].id,
-            delay:
-              body.type === 'now'
-                ? 0
-                : dayjs(posts[0].publishDate).diff(dayjs(), 'millisecond'),
-          },
-        });
+      if (body.type !== 'update') {
+        this.startWorkflow(
+          post.settings.__type.split('-')[0].toLowerCase(),
+          posts[0].id,
+          orgId,
+          posts[0].state
+        ).catch((err) => {});
       }
 
       Sentry.metrics.count('post_created', 1);
@@ -698,104 +1226,223 @@ export class PostsService {
     return postList;
   }
 
-  async separatePosts(content: string, len: number) {
-    return this.openaiService.separatePosts(content, len);
-  }
+  // Update ONLY the provider settings of a not-yet-published post (scheduled or
+  // draft). The passed keys are merged into the existing settings; content and
+  // publish date stay as they are, so the running publish workflow is left
+  // untouched (type "update"). Shared by the agent/MCP tool and the public API
+  // PUT /posts/:id/settings so both go through one path.
+  async updatePostSettings(
+    orgId: string,
+    postId: string,
+    settings: Record<string, any>,
+    creationMethod: CreationMethod
+  ): Promise<{ postId: string; publishDate: string }> {
+    // Ordered as post -> comments, root includes integration and tags.
+    const ordered = await this.getPostsRecursively(postId, true, orgId, true);
 
-  async changeDate(orgId: string, id: string, date: string) {
-    const getPostById = await this._postRepository.getPostById(id, orgId);
-
-    await this._workerServiceProducer.delete('post', id);
-    if (getPostById?.state !== 'DRAFT') {
-      this._workerServiceProducer.emit('post', {
-        id: id,
-        options: {
-          delay: dayjs(date).diff(dayjs(), 'millisecond'),
-        },
-        payload: {
-          id: id,
-          delay: dayjs(date).diff(dayjs(), 'millisecond'),
-        },
-      });
+    const [root] = ordered;
+    if (!root) {
+      throw new NotFoundException('Post not found');
     }
 
-    return this._postRepository.changeDate(orgId, id, date);
-  }
-
-  async payout(id: string, url: string) {
-    const getPost = await this._postRepository.getPostById(id);
-    if (!getPost || !getPost.submittedForOrder) {
-      return;
-    }
-
-    const findPrice = getPost.submittedForOrder.ordersItems.find(
-      (orderItem) => orderItem.integrationId === getPost.integrationId
-    )!;
-
-    await this._messagesService.createNewMessage(
-      getPost.submittedForOrder.messageGroupId,
-      From.SELLER,
-      '',
-      {
-        type: 'published',
-        data: {
-          id: getPost.submittedForOrder.id,
-          postId: id,
-          status: 'PUBLISHED',
-          integrationId: getPost.integrationId,
-          integration: getPost.integration.providerIdentifier,
-          picture: getPost.integration.picture,
-          name: getPost.integration.name,
-          url,
-        },
-      }
-    );
-
-    const totalItems = getPost.submittedForOrder.ordersItems.reduce(
-      (all, p) => all + p.quantity,
-      0
-    );
-    const totalPosts = getPost.submittedForOrder.posts.length;
-
-    if (totalItems === totalPosts) {
-      await this._messagesService.completeOrder(getPost.submittedForOrder.id);
-      await this._messagesService.createNewMessage(
-        getPost.submittedForOrder.messageGroupId,
-        From.SELLER,
-        '',
-        {
-          type: 'order-completed',
-          data: {
-            id: getPost.submittedForOrder.id,
-            postId: id,
-            status: 'PUBLISHED',
-          },
-        }
+    if (root.parentPostId) {
+      throw new BadRequestException(
+        'This id belongs to a comment, pass the id of the main post'
       );
     }
+
+    if (root.state !== 'QUEUE' && root.state !== 'DRAFT') {
+      throw new BadRequestException(
+        'Only scheduled posts that were not published yet (or drafts) can be updated'
+      );
+    }
+
+    if (
+      root.state === 'QUEUE' &&
+      dayjs.utc(root.publishDate).isBefore(dayjs.utc())
+    ) {
+      throw new BadRequestException(
+        'The publish time of this post already passed, it cannot be updated'
+      );
+    }
+
+    const integration = (root as any).integration;
+
+    let existingSettings: Record<string, any>;
+    try {
+      existingSettings = JSON.parse(root.settings || '{}');
+    } catch (err) {
+      existingSettings = {};
+    }
+
+    // Merge: only the passed keys change, everything else stays.
+    const mergedSettings = {
+      ...existingSettings,
+      ...(settings || {}),
+      __type: integration.providerIdentifier,
+    };
+
+    // Keep the existing content/ids so the posts are updated in place (the
+    // workflow identity is preserved) - only the settings differ.
+    const value = ordered.map((p) => {
+      let image = [];
+      try {
+        image = JSON.parse(p.image || '[]');
+      } catch (err) {}
+      return {
+        id: p.id,
+        content: p.content,
+        delay: p.delay || 0,
+        image,
+      };
+    });
+
+    // Same server-side validation as the dashboard / public create route.
+    const [validation] = await this.validatePosts(orgId, [
+      {
+        integration: { id: integration.id },
+        settings: mergedSettings,
+        value: value.map((p) => ({ content: p.content, image: p.image })),
+      },
+    ]);
+
+    if (validation.emptyContent) {
+      throw new BadRequestException(
+        `${validation.name}: Your post should have at least one character or one image.`
+      );
+    }
+
+    if (root.state !== 'DRAFT') {
+      if (!validation.valid) {
+        throw new BadRequestException(
+          `${validation.name}: ${
+            validation.settingsError || 'Please fix your settings'
+          }`
+        );
+      }
+
+      if (validation.errors !== true) {
+        throw new BadRequestException(
+          `${validation.name}: ${validation.errors}`
+        );
+      }
+
+      if (validation.tooLong) {
+        throw new BadRequestException(
+          `${validation.name}: The maximum characters is ${validation.maximumCharacters}`
+        );
+      }
+    }
+
+    const date = dayjs.utc(root.publishDate).format('YYYY-MM-DDTHH:mm:ss');
+
+    const [output] = await this.createPost(
+      orgId,
+      {
+        date,
+        // Settings-only update: keep the current state and leave the running
+        // publish workflow alone.
+        type: 'update',
+        shortLink: false,
+        tags: ((root as any).tags || []).map((t: any) => ({
+          value: t.tag.name,
+          label: t.tag.name,
+        })),
+        posts: [
+          {
+            integration,
+            group: root.group,
+            settings: mergedSettings,
+            value,
+          },
+        ],
+      } as any,
+      creationMethod,
+      // Keep the group stable: a client may have the calendar open while the
+      // settings are updated out of band, and the calendar links posts by group.
+      true
+    );
+
+    if (!output) {
+      throw new BadRequestException('Failed to update the post');
+    }
+
+    return {
+      postId: output.postId,
+      publishDate: date,
+    };
+  }
+
+  async separatePosts(content: string, len: number) {
+    return this._openaiService.separatePosts(content, len);
+  }
+
+  async changeState(id: string, state: State, err?: any, body?: any) {
+    return this._postRepository.changeState(id, state, err, body);
+  }
+
+  async changePostStatus(
+    orgId: string,
+    id: string,
+    status: 'draft' | 'schedule'
+  ) {
+    const getPostById = await this._postRepository.getPostById(id, orgId);
+    if (!getPostById) {
+      throw new BadRequestException('Post not found');
+    }
+
+    const state: State = status === 'draft' ? 'DRAFT' : 'QUEUE';
+    await this._postRepository.changeState(id, state);
 
     try {
-      await this._stripeService.payout(
-        getPost.submittedForOrder.id,
-        getPost.submittedForOrder.captureId!,
-        getPost.submittedForOrder.seller.account!,
-        findPrice.price
+      await this.startWorkflow(
+        getPostById.integration.providerIdentifier.split('-')[0].toLowerCase(),
+        getPostById.id,
+        orgId,
+        state
       );
+    } catch (err) {}
 
-      return this._notificationService.inAppNotification(
-        getPost.integration.organizationId,
-        'Payout completed',
-        `You have received a payout of $${findPrice.price}`,
-        true
-      );
-    } catch (err) {
-      await this._messagesService.payoutProblem(
-        getPost.submittedForOrder.id,
-        getPost.submittedForOrder.seller.id,
-        findPrice.price,
-        id
-      );
+    return { id, state };
+  }
+
+  async changeDate(
+    orgId: string,
+    id: string,
+    date: string,
+    action: 'schedule' | 'update' = 'schedule',
+    republish = false
+  ) {
+    const getPostById = await this._postRepository.getPostById(id, orgId);
+
+    if (action === 'schedule' && !republish) {
+      this.guardAgainstRepublish(getPostById, 'changeDate');
     }
+
+    // schedule: Set status to QUEUE and change date (reschedule the post)
+    // update: Just change the date without changing the status
+    const newDate = await this._postRepository.changeDate(
+      orgId,
+      id,
+      date,
+      getPostById.state === 'DRAFT',
+      action
+    );
+
+    if (action === 'schedule') {
+      try {
+        await this.startWorkflow(
+          getPostById.integration.providerIdentifier
+            .split('-')[0]
+            .toLowerCase(),
+          getPostById.id,
+          orgId,
+          getPostById.state === 'DRAFT' ? 'DRAFT' : 'QUEUE'
+        );
+      } catch (err) {}
+    }
+
+    return newDate;
   }
 
   async generatePostsDraft(orgId: string, body: CreateGeneratedPostsDto) {
@@ -838,41 +1485,47 @@ export class PostsService {
         const group = makeId(10);
         const randomDate = findTime();
 
-        await this.createPost(orgId, {
-          type: 'draft',
-          date: randomDate,
-          order: '',
-          shortLink: false,
-          tags: [],
-          posts: [
-            {
-              group,
-              integration: {
-                id: integration.id,
-              },
-              settings: {
-                __type: integration.providerIdentifier as any,
-                title: '',
-                tags: [],
-                subreddit: [],
-              },
-              value: [
-                ...toPost.list.map((l) => ({
-                  id: '',
-                  content: l.post,
-                  image: [],
-                })),
-                {
-                  id: '',
-                  content: `Check out the full story here:\n${
-                    body.postId || body.url
-                  }`,
-                  image: [],
+        await this.createPost(
+          orgId,
+          {
+            type: 'draft',
+            date: randomDate,
+            order: '',
+            shortLink: false,
+            tags: [],
+            posts: [
+              {
+                group,
+                integration: {
+                  id: integration.id,
                 },
-              ],
-            },
-          ],
-        });
+                settings: {
+                  __type: integration.providerIdentifier as any,
+                  title: '',
+                  tags: [],
+                  subreddit: [],
+                },
+                value: [
+                  ...toPost.list.map((l) => ({
+                    id: '',
+                    content: l.post,
+                    delay: 0,
+                    image: [],
+                  })),
+                  {
+                    id: '',
+                    delay: 0,
+                    content: `Check out the full story here:\n${
+                      body.postId || body.url
+                    }`,
+                    image: [],
+                  },
+                ],
+              },
+            ],
+          },
+          'WEB'
+        );
       }
     }
   }
@@ -896,8 +1549,9 @@ export class PostsService {
     );
     return this.findFreeDateTimeRecursive(
       orgId,
-      findTimes,
-      dayjs.utc().startOf('day')
+      findTimes.length ? findTimes : [120, 400, 700],
+      dayjs.utc().startOf('day'),
+      0
     );
   }
 
@@ -913,8 +1567,17 @@ export class PostsService {
   private async findFreeDateTimeRecursive(
     orgId: string,
     times: number[],
-    date: dayjs.Dayjs
+    date: dayjs.Dayjs,
+    daysChecked: number
   ): Promise<string> {
+    // stop searching after a year so an empty times list can never recurse forever
+    if (daysChecked > 365) {
+      return date
+        .clone()
+        .add(times[0] || 0, 'minutes')
+        .format('YYYY-MM-DDTHH:mm:00');
+    }
+
     const list = await this._postRepository.getPostsCountsByDates(
       orgId,
       times,
@@ -922,7 +1585,12 @@ export class PostsService {
     );
 
     if (!list.length) {
-      return this.findFreeDateTimeRecursive(orgId, times, date.add(1, 'day'));
+      return this.findFreeDateTimeRecursive(
+        orgId,
+        times,
+        date.add(1, 'day'),
+        daysChecked + 1
+      );
     }
 
     const num = list.reduce<null | number>((prev, curr) => {
@@ -935,8 +1603,170 @@ export class PostsService {
     return date.clone().add(num, 'minutes').format('YYYY-MM-DDTHH:mm:00');
   }
 
-  getComments(postId: string) {
-    return this._postRepository.getComments(postId);
+  async getComments(previewId: string) {
+    const posts = await this.getPostsRecursively(previewId, false);
+    const comments = await this._postRepository.getCommentsForPosts(
+      posts.map((p) => p.id)
+    );
+
+    return comments.map((comment) => ({
+      id: comment.id,
+      postId: comment.postId,
+      parentId: comment.parentId,
+      content: comment.content,
+      anchorStart: comment.anchorStart,
+      anchorEnd: comment.anchorEnd,
+      anchorQuote: comment.anchorQuote,
+      resolvedAt: comment.resolvedAt,
+      createdAt: comment.createdAt,
+      name: comment.userId
+        ? [comment.user?.name, comment.user?.lastName]
+            .filter(Boolean)
+            .join(' ')
+            .trim() || null
+        : comment.displayName,
+    }));
+  }
+
+  async createPublicComment(
+    previewId: string,
+    body: CreatePublicCommentDto,
+    userId: string | null,
+    ip: string
+  ) {
+    const posts = await this.getPostsRecursively(previewId, false);
+    if (!posts.length) {
+      throw new NotFoundException('Post not found');
+    }
+
+    let post = body.postId ? posts.find((p) => p.id === body.postId) : posts[0];
+    if (!post) {
+      throw new BadRequestException('Post does not belong to this preview');
+    }
+
+    if (!userId) {
+      if (!body.displayName?.trim()) {
+        throw new BadRequestException('Name is required');
+      }
+      await this.verifyRecaptcha(body.recaptchaToken, ip);
+    }
+
+    const hasStart = typeof body.anchorStart === 'number';
+    const hasEnd = typeof body.anchorEnd === 'number';
+    if (hasStart !== hasEnd) {
+      throw new BadRequestException('Both anchor offsets are required');
+    }
+
+    if (body.parentId) {
+      const parent = await this._postRepository.getCommentById(body.parentId);
+      if (!parent || !posts.some((p) => p.id === parent.postId)) {
+        throw new BadRequestException('Parent comment not found');
+      }
+      if (parent.parentId) {
+        throw new BadRequestException(
+          'Replies can only be added to a root comment'
+        );
+      }
+      if (hasStart || body.anchorQuote) {
+        throw new BadRequestException('Replies cannot be anchored');
+      }
+      post = posts.find((p) => p.id === parent.postId)!;
+    }
+
+    if (hasStart) {
+      const plainText = postContentPlainText(post.content);
+      if (
+        body.anchorStart! < 0 ||
+        body.anchorStart! >= body.anchorEnd! ||
+        body.anchorEnd! > plainText.length
+      ) {
+        throw new BadRequestException('Anchor is out of range');
+      }
+      if (
+        body.anchorQuote !== plainText.slice(body.anchorStart!, body.anchorEnd!)
+      ) {
+        throw new BadRequestException('Anchor does not match the post text');
+      }
+    }
+
+    return this._postRepository.createComment(
+      post.organizationId,
+      userId,
+      post.id,
+      body.content,
+      {
+        displayName: userId ? undefined : body.displayName!.trim(),
+        parentId: body.parentId,
+        anchorStart: hasStart ? body.anchorStart : undefined,
+        anchorEnd: hasStart ? body.anchorEnd : undefined,
+        anchorQuote: hasStart ? body.anchorQuote : undefined,
+      }
+    );
+  }
+
+  private async verifyRecaptcha(token: string | undefined, ip: string) {
+    if (!process.env.RECAPTCHA_SECRET_KEY) {
+      return;
+    }
+
+    if (!token) {
+      throw new BadRequestException('Captcha verification failed');
+    }
+
+    const result = await (
+      await fetch('https://www.google.com/recaptcha/api/siteverify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          secret: process.env.RECAPTCHA_SECRET_KEY,
+          response: token,
+          remoteip: ip,
+        }),
+      })
+    ).json();
+
+    if (!result?.success) {
+      throw new BadRequestException('Captcha verification failed');
+    }
+  }
+
+  async resolveComment(orgId: string, commentId: string, resolved: boolean) {
+    const comment = await this._postRepository.getCommentById(commentId);
+    if (!comment || comment.post.organizationId !== orgId) {
+      throw new NotFoundException('Comment not found');
+    }
+    if (comment.parentId) {
+      throw new BadRequestException('Only root comments can be resolved');
+    }
+
+    return this._postRepository.setCommentResolved(
+      commentId,
+      resolved ? new Date() : null
+    );
+  }
+
+  // A comment anchored to a span of text keeps its quote but loses the
+  // highlight once the span no longer reads the same on the new content.
+  async detachStaleAnchors(posts: { id: string; content: string }[]) {
+    for (const post of posts) {
+      const anchored = await this._postRepository.getAnchoredCommentsForPost(
+        post.id
+      );
+      if (!anchored.length) {
+        continue;
+      }
+
+      const plainText = postContentPlainText(post.content);
+      const stale = anchored
+        .filter(
+          (c) => c.anchorQuote !== plainText.slice(c.anchorStart!, c.anchorEnd!)
+        )
+        .map((c) => c.id);
+
+      if (stale.length) {
+        await this._postRepository.detachAnchorsForPost(post.id, stale);
+      }
+    }
   }
 
   getTags(orgId: string) {
@@ -951,36 +1781,7 @@ export class PostsService {
     return this._postRepository.editTag(id, orgId, body);
   }
 
-  createComment(
-    orgId: string,
-    userId: string,
-    postId: string,
-    comment: string
-  ) {
-    return this._postRepository.createComment(orgId, userId, postId, comment);
-  }
-
-  async sendDigestEmail(subject: string, orgId: string, since: string) {
-    const getNotificationsForOrgSince =
-      await this._notificationService.getNotificationsSince(orgId, since);
-    if (getNotificationsForOrgSince.length === 0) {
-      return;
-    }
-
-    // Get the types of notifications in this digest
-    const types = await this._notificationService.getDigestTypes(orgId);
-
-    const message = getNotificationsForOrgSince
-      .map((p) => p.content)
-      .join('<br />');
-
-    await this._notificationService.sendDigestEmailsToOrg(
-      orgId,
-      getNotificationsForOrgSince.length === 1
-        ? subject
-        : '[Postiz] Your latest notifications',
-      message,
-      types.length > 0 ? types : ['success'] // Default to success if no types tracked
-    );
+  deleteTag(id: string, orgId: string) {
+    return this._postRepository.deleteTag(id, orgId);
   }
 }

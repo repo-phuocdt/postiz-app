@@ -1,9 +1,10 @@
+'use client';
+
 import React, { FC, Fragment, useCallback, useMemo, useState } from 'react';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import useSWR from 'swr';
 import { Button } from '@gitroom/react/form/button';
 import { useModals } from '@gitroom/frontend/components/layout/new-modal';
-import { TopTitle } from '@gitroom/frontend/components/launches/helpers/top.title.component';
 import { Input } from '@gitroom/react/form/input';
 import { FormProvider, useForm } from 'react-hook-form';
 import { array, boolean, object, string } from 'yup';
@@ -28,7 +29,7 @@ export const Autopost: FC = () => {
   const addWebhook = useCallback(
     (data?: any) => () => {
       modal.openModal({
-        title: data ? 'Edit Autopost' : 'Add Autopost',
+        title: data ? t('edit_autopost', 'Edit Autopost') : t('add_autopost_title', 'Add Autopost'),
         withCloseButton: true,
         children: <AddOrEditWebhook data={data} reload={mutate} />,
       });
@@ -50,7 +51,7 @@ export const Autopost: FC = () => {
           method: 'DELETE',
         });
         mutate();
-        toaster.show('Webhook deleted successfully', 'success');
+        toaster.show(t('webhook_deleted_successfully', 'Webhook deleted successfully'), 'success');
       }
     },
     []
@@ -72,8 +73,8 @@ export const Autopost: FC = () => {
       <h3 className="text-[20px]">{t('autopost', 'Autopost')}</h3>
       <div className="text-customColor18 mt-[4px]">
         {t(
-          'autopost_can_automatically_posts_your_rss_new_items_to_social_media',
-          'Autopost can automatically posts your RSS new items to social media'
+          'autopost_creates_drafts_from_your_rss_new_items',
+          'Autopost creates drafts from your RSS new items, review and schedule them from the calendar to publish them'
         )}
       </div>
       <div className="my-[16px] mt-[16px] bg-sixth border-fifth items-center border rounded-[4px] p-[24px] flex gap-[24px]">
@@ -142,33 +143,23 @@ const details = object().shape({
     })
   ),
 });
-const options = [
+const getOptions = (t: (key: string, fallback: string) => string) => [
   {
-    label: 'All integrations',
+    label: t('all_integrations', 'All integrations'),
     value: 'all',
   },
   {
-    label: 'Specific integrations',
+    label: t('specific_integrations', 'Specific integrations'),
     value: 'specific',
   },
 ];
-const optionsChoose = [
+const getOptionsChoose = (t: (key: string, fallback: string) => string) => [
   {
-    label: 'Yes',
+    label: t('yes', 'Yes'),
     value: true,
   },
   {
-    label: 'No',
-    value: false,
-  },
-];
-const postImmediately = [
-  {
-    label: 'Post on the next available slot',
-    value: true,
-  },
-  {
-    label: 'Post Immediately',
+    label: t('no', 'No'),
     value: false,
   },
 ];
@@ -178,6 +169,9 @@ export const AddOrEditWebhook: FC<{
 }> = (props) => {
   const { data, reload } = props;
   const fetch = useFetch();
+  const t = useT();
+  const options = getOptions(t);
+  const optionsChoose = getOptionsChoose(t);
   const [allIntegrations, setAllIntegrations] = useState(
     (JSON.parse(data?.integrations || '[]')?.length || 0) > 0
       ? options[1]
@@ -255,8 +249,8 @@ export const AddOrEditWebhook: FC<{
       });
       toast.show(
         data?.id
-          ? 'Autopost updated successfully'
-          : 'Autopost added successfully',
+          ? t('autopost_updated_successfully', 'Autopost updated successfully')
+          : t('autopost_added_successfully', 'Autopost added successfully'),
         'success'
       );
       modal.closeAll();
@@ -277,18 +271,16 @@ export const AddOrEditWebhook: FC<{
       ).json();
       if (!success) {
         setValid('');
-        toast.show('Could not use this RSS feed', 'warning');
+        toast.show(t('could_not_use_rss_feed', 'Could not use this RSS feed'), 'warning');
         return;
       }
-      toast.show('RSS valid!', 'success');
+      toast.show(t('rss_valid', 'RSS valid!'), 'success');
       setValid(url);
       setLastUrl(newUrl);
     } catch (e: any) {
       /** empty **/
     }
   }, []);
-
-  const t = useT();
 
   return (
     <FormProvider {...form}>
@@ -321,19 +313,6 @@ export const AddOrEditWebhook: FC<{
               ))}
             </Select>
             <Select
-              label="When should we post it?"
-              translationKey="label_when_post"
-              {...form.register('onSlot', {
-                setValueAs: (value) => value === 'true' || value === true,
-              })}
-            >
-              {postImmediately.map((option) => (
-                <option key={String(option.value)} value={String(option.value)}>
-                  {option.label}
-                </option>
-              ))}
-            </Select>
-            <Select
               label="Autogenerate content"
               translationKey="label_autogenerate_content"
               {...form.register('generateContent', {
@@ -360,7 +339,7 @@ export const AddOrEditWebhook: FC<{
                   onChange={(e) => {
                     form.setValue('content', e.target.value);
                   }}
-                  placeholder="Write your post..."
+                  placeholder={t('write_your_post_placeholder', 'Write your post...')}
                   autosuggestionsConfig={{
                     textareaPurpose: `Assist me in writing social media post`,
                     chatApiConfigs: {},

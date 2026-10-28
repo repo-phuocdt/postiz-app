@@ -15,6 +15,8 @@ import DribbbleProvider from '@gitroom/frontend/components/new-launch/providers/
 import ThreadsProvider from '@gitroom/frontend/components/new-launch/providers/threads/threads.provider';
 import DiscordProvider from '@gitroom/frontend/components/new-launch/providers/discord/discord.provider';
 import SlackProvider from '@gitroom/frontend/components/new-launch/providers/slack/slack.provider';
+import KickProvider from '@gitroom/frontend/components/new-launch/providers/kick/kick.provider';
+import TwitchProvider from '@gitroom/frontend/components/new-launch/providers/twitch/twitch.provider';
 import MastodonProvider from '@gitroom/frontend/components/new-launch/providers/mastodon/mastodon.provider';
 import BlueskyProvider from '@gitroom/frontend/components/new-launch/providers/bluesky/bluesky.provider';
 import LemmyProvider from '@gitroom/frontend/components/new-launch/providers/lemmy/lemmy.provider';
@@ -33,6 +35,11 @@ import { PostComment } from '@gitroom/frontend/components/new-launch/providers/h
 import WordpressProvider from '@gitroom/frontend/components/new-launch/providers/wordpress/wordpress.provider';
 import ListmonkProvider from '@gitroom/frontend/components/new-launch/providers/listmonk/listmonk.provider';
 import GmbProvider from '@gitroom/frontend/components/new-launch/providers/gmb/gmb.provider';
+import MoltbookProvider from '@gitroom/frontend/components/new-launch/providers/moltbook/moltbook.provider';
+import SkoolProvider from '@gitroom/frontend/components/new-launch/providers/skool/skool.provider';
+import WhopProvider from '@gitroom/frontend/components/new-launch/providers/whop/whop.provider';
+import MeweProvider from '@gitroom/frontend/components/new-launch/providers/mewe/mewe.provider';
+import TumblrProvider from '@gitroom/frontend/components/new-launch/providers/tumblr/tumblr.provider';
 
 export const Providers = [
   {
@@ -84,6 +91,10 @@ export const Providers = [
     component: TiktokProvider,
   },
   {
+    identifier: 'tiktok-business',
+    component: TiktokProvider,
+  },
+  {
     identifier: 'pinterest',
     component: PinterestProvider,
   },
@@ -102,6 +113,14 @@ export const Providers = [
   {
     identifier: 'slack',
     component: SlackProvider,
+  },
+  {
+    identifier: 'kick',
+    component: KickProvider,
+  },
+  {
+    identifier: 'twitch',
+    component: TwitchProvider,
   },
   {
     identifier: 'mastodon',
@@ -142,6 +161,26 @@ export const Providers = [
   {
     identifier: 'gmb',
     component: GmbProvider,
+  },
+  {
+    identifier: 'moltbook',
+    component: MoltbookProvider,
+  },
+  {
+    identifier: 'skool',
+    component: SkoolProvider,
+  },
+  {
+    identifier: 'whop',
+    component: WhopProvider,
+  },
+  {
+    identifier: 'mewe',
+    component: MeweProvider,
+  },
+  {
+    identifier: 'tumblr',
+    component: TumblrProvider,
   },
 ];
 export const ShowAllProviders = forwardRef((props, ref) => {
@@ -200,7 +239,9 @@ export const ShowAllProviders = forwardRef((props, ref) => {
               )}
             </div>
           ) : (
-            <GeneralPreviewComponent maximumCharacters={100000000} />
+            <div className="border border-borderPreview rounded-[12px] shadow-previewShadow">
+              <GeneralPreviewComponent maximumCharacters={100000000} />
+            </div>
           )}
         </IntegrationContext.Provider>
       )}

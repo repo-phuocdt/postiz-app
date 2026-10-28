@@ -5,13 +5,14 @@ import {
   PostResponse,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
-import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
+import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
 import { LinkedinProvider } from '@gitroom/nestjs-libraries/integrations/social/linkedin.provider';
 import dayjs from 'dayjs';
 import { Integration } from '@prisma/client';
 import { Plug } from '@gitroom/helpers/decorators/plug.decorator';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
+import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashboard.function.decorator';
 
 @Rules(
   'LinkedIn can have maximum one attachment when selecting video, when choosing a carousel on LinkedIn minimum amount of attachment must be two, and only pictures, if uploading a video, LinkedIn can have only one attachment'
@@ -90,6 +91,21 @@ export class LinkedinPageProvider
     };
   }
 
+  override async addComment(
+    integration: Integration,
+    originalIntegration: Integration,
+    postId: string,
+    information: any,
+  ) {
+    return super.addComment(
+      integration,
+      originalIntegration,
+      postId,
+      information,
+      false
+    );
+  }
+
   override async repostPostUsers(
     integration: Integration,
     originalIntegration: Integration,
@@ -106,8 +122,8 @@ export class LinkedinPageProvider
   }
 
   override async generateAuthUrl() {
-    const state = makeId(6);
-    const codeVerifier = makeId(30);
+    const state = makeSecureId(6);
+    const codeVerifier = makeSecureId(30);
     const url = `https://www.linkedin.com/oauth/v2/authorization?response_type=code&prompt=none&client_id=${
       process.env.LINKEDIN_CLIENT_ID
     }&redirect_uri=${encodeURIComponent(
@@ -120,29 +136,36 @@ export class LinkedinPageProvider
     };
   }
 
+  @DashboardFunction()
   async companies(accessToken: string) {
     const { elements, ...all } = await (
       await fetch(
-        'https://api.linkedin.com/v2/organizationalEntityAcls?q=roleAssignee&role=ADMINISTRATOR&projection=(elements*(organizationalTarget~(localizedName,vanityName,logoV2(original~:playableStreams))))',
+        'https://api.linkedin.com/v2/organizationalEntityAcls?q=roleAssignee&state=APPROVED&projection=(elements*(role,organizationalTarget~(localizedName,vanityName,logoV2(original~:playableStreams))))',
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             'X-Restli-Protocol-Version': '2.0.0',
-            'LinkedIn-Version': '202501',
+            'LinkedIn-Version': '202601',
           },
         }
       )
     ).json();
 
-    return (elements || []).map((e: any) => ({
-      id: e.organizationalTarget.split(':').pop(),
-      page: e.organizationalTarget.split(':').pop(),
-      username: e['organizationalTarget~'].vanityName,
-      name: e['organizationalTarget~'].localizedName,
-      picture:
-        e['organizationalTarget~'].logoV2?.['original~']?.elements?.[0]
-          ?.identifiers?.[0]?.identifier,
-    }));
+    return (elements || [])
+      .filter(
+        (e: any) =>
+          e['organizationalTarget~'] &&
+          ['ADMINISTRATOR', 'CONTENT_ADMINISTRATOR'].includes(e.role)
+      )
+      .map((e: any) => ({
+        id: e.organizationalTarget.split(':').pop(),
+        page: e.organizationalTarget.split(':').pop(),
+        username: e['organizationalTarget~'].vanityName,
+        name: e['organizationalTarget~'].localizedName,
+        picture:
+          e['organizationalTarget~'].logoV2?.['original~']?.elements?.[0]
+            ?.identifiers?.[0]?.identifier,
+      }));
   }
 
   async reConnect(
@@ -239,7 +262,9 @@ export class LinkedinPageProvider
     ).json();
 
     return {
-      id: `p_${id}`,
+      // namespaced placeholder so the in-between row never collides with the
+      // personal LinkedIn channel row (same org + same member sub)
+      id: `${this.identifier}_${id}`,
       accessToken,
       refreshToken,
       expiresIn,
@@ -258,6 +283,42 @@ export class LinkedinPageProvider
     return super.post(id, accessToken, postDetails, integration, 'company');
   }
 
+  // checkPostStatus / finalizePost are inherited as-is: the company context
+  // travels inside pendingData (postType), set here once.
+  override async postPending(
+    id: string,
+    accessToken: string,
+    postDetails: PostDetails[],
+    integration: Integration
+  ): Promise<PostResponse[]> {
+    return super.postPending(
+      id,
+      accessToken,
+      postDetails,
+      integration,
+      'company'
+    );
+  }
+
+  override async comment(
+    id: string,
+    postId: string,
+    lastCommentId: string | undefined,
+    accessToken: string,
+    postDetails: PostDetails[],
+    integration: Integration
+  ): Promise<PostResponse[]> {
+    return super.comment(
+      id,
+      postId,
+      lastCommentId,
+      accessToken,
+      postDetails,
+      integration,
+      'company'
+    );
+  }
+
   async analytics(
     id: string,
     accessToken: string,
@@ -274,7 +335,7 @@ export class LinkedinPageProvider
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,
-            'Linkedin-Version': '202405',
+            'Linkedin-Version': '202601',
             'X-Restli-Protocol-Version': '2.0.0',
           },
         }
@@ -289,7 +350,7 @@ export class LinkedinPageProvider
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,
-            'Linkedin-Version': '202405',
+            'Linkedin-Version': '202601',
             'X-Restli-Protocol-Version': '2.0.0',
           },
         }
@@ -304,7 +365,7 @@ export class LinkedinPageProvider
         {
           headers: {
             Authorization: `Bearer ${accessToken}`,
-            'Linkedin-Version': '202405',
+            'Linkedin-Version': '202601',
             'X-Restli-Protocol-Version': '2.0.0',
           },
         }
@@ -383,6 +444,131 @@ export class LinkedinPageProvider
     }));
   }
 
+  async postAnalytics(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    date: number
+  ): Promise<AnalyticsData[]> {
+    // Fetch lifetime share statistics for the specific post.
+    // LinkedIn does not support time-bound statistics for specific share queries,
+    // so no timeIntervals is sent and elements come back without a timeRange.
+    const shareStatsUrl = `https://api.linkedin.com/v2/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(
+      `urn:li:organization:${integrationId}`
+    )}&shares=List(${encodeURIComponent(postId)})`;
+
+    const { elements: shareElements }: { elements: PostShareStatElement[] } =
+      await (
+        await fetch(shareStatsUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'LinkedIn-Version': '202601',
+            'X-Restli-Protocol-Version': '2.0.0',
+          },
+        })
+      ).json();
+
+    // Also fetch social actions (likes, comments, shares) for the specific post
+    let socialActions: SocialActionsResponse | null = null;
+    try {
+      const socialActionsUrl = `https://api.linkedin.com/v2/socialActions/${encodeURIComponent(
+        postId
+      )}`;
+      socialActions = await (
+        await fetch(socialActionsUrl, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'LinkedIn-Version': '202601',
+            'X-Restli-Protocol-Version': '2.0.0',
+          },
+        })
+      ).json();
+    } catch (e) {
+      // Social actions may not be available for all posts
+    }
+
+    // Process share statistics into time series data
+    const analytics = (shareElements || []).reduce(
+      (all, current) => {
+        if (typeof current?.totalShareStatistics !== 'undefined') {
+          const dateStr = dayjs(current.timeRange?.start).format('YYYY-MM-DD');
+
+          all['Impressions'].push({
+            total: current.totalShareStatistics.impressionCount || 0,
+            date: dateStr,
+          });
+
+          all['Unique Impressions'].push({
+            total: current.totalShareStatistics.uniqueImpressionsCount || 0,
+            date: dateStr,
+          });
+
+          all['Clicks'].push({
+            total: current.totalShareStatistics.clickCount || 0,
+            date: dateStr,
+          });
+
+          all['Likes'].push({
+            total: current.totalShareStatistics.likeCount || 0,
+            date: dateStr,
+          });
+
+          all['Comments'].push({
+            total: current.totalShareStatistics.commentCount || 0,
+            date: dateStr,
+          });
+
+          all['Shares'].push({
+            total: current.totalShareStatistics.shareCount || 0,
+            date: dateStr,
+          });
+
+          all['Engagement'].push({
+            total: current.totalShareStatistics.engagement || 0,
+            date: dateStr,
+          });
+        }
+        return all;
+      },
+      {
+        Impressions: [] as { total: number; date: string }[],
+        'Unique Impressions': [] as { total: number; date: string }[],
+        Clicks: [] as { total: number; date: string }[],
+        Likes: [] as { total: number; date: string }[],
+        Comments: [] as { total: number; date: string }[],
+        Shares: [] as { total: number; date: string }[],
+        Engagement: [] as { total: number; date: string }[],
+      }
+    );
+
+    // If no time series data but we have social actions, create a single data point
+    if (
+      Object.values(analytics).every((arr) => arr.length === 0) &&
+      socialActions
+    ) {
+      const today = dayjs().format('YYYY-MM-DD');
+      analytics['Likes'].push({
+        total: socialActions.likesSummary?.totalLikes || 0,
+        date: today,
+      });
+      analytics['Comments'].push({
+        total: socialActions.commentsSummary?.totalFirstLevelComments || 0,
+        date: today,
+      });
+    }
+
+    // Filter out empty analytics
+    const result = Object.entries(analytics)
+      .filter(([_, data]) => data.length > 0)
+      .map(([label, data]) => ({
+        label,
+        data,
+        percentageChange: 0,
+      }));
+
+    return result as any;
+  }
+
   @Plug({
     identifier: 'linkedin-page-autoRepostPost',
     title: 'Auto Repost Posts',
@@ -415,7 +601,7 @@ export class LinkedinPageProvider
           headers: {
             'X-Restli-Protocol-Version': '2.0.0',
             'Content-Type': 'application/json',
-            'LinkedIn-Version': '202501',
+            'LinkedIn-Version': '202601',
             Authorization: `Bearer ${integration.token}`,
           },
         }
@@ -444,7 +630,7 @@ export class LinkedinPageProvider
         headers: {
           'X-Restli-Protocol-Version': '2.0.0',
           'Content-Type': 'application/json',
-          'LinkedIn-Version': '202504',
+          'LinkedIn-Version': '202601',
           Authorization: `Bearer ${integration.token}`,
         },
       });
@@ -493,7 +679,7 @@ export class LinkedinPageProvider
           headers: {
             'X-Restli-Protocol-Version': '2.0.0',
             'Content-Type': 'application/json',
-            'LinkedIn-Version': '202501',
+            'LinkedIn-Version': '202601',
             Authorization: `Bearer ${integration.token}`,
           },
         }
@@ -729,4 +915,31 @@ export interface MobileInsightsPageViews {
 export interface TimeRange {
   start: number;
   end: number;
+}
+
+// Post analytics interfaces
+export interface PostShareStatElement {
+  organizationalEntity: string;
+  share: string;
+  totalShareStatistics: {
+    uniqueImpressionsCount: number;
+    shareCount: number;
+    engagement: number;
+    clickCount: number;
+    likeCount: number;
+    impressionCount: number;
+    commentCount: number;
+  };
+  timeRange?: TimeRange;
+}
+
+export interface SocialActionsResponse {
+  likesSummary?: {
+    totalLikes: number;
+    likedByCurrentUser: boolean;
+  };
+  commentsSummary?: {
+    totalFirstLevelComments: number;
+    commentsState: string;
+  };
 }

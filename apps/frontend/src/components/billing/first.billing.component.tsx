@@ -1,11 +1,10 @@
 'use client';
 
 import React, { FC, useCallback, useEffect, useMemo, useState } from 'react';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import { useVariables } from '@gitroom/react/helpers/variable.context';
 import { loadStripe, Stripe } from '@stripe/stripe-js';
-import { useSearchParams } from 'next/navigation';
 import { OrganizationSelector } from '@gitroom/frontend/components/layout/organization.selector';
 import { LanguageComponent } from '@gitroom/frontend/components/layout/language.component';
 import { AttachToFeedbackIcon } from '@gitroom/frontend/components/new-layout/sentry.feedback.component';
@@ -23,7 +22,13 @@ import {
 } from '@gitroom/frontend/components/billing/faq.component';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { useUser } from '@gitroom/frontend/components/layout/user.context';
-import { useTolt } from '@gitroom/frontend/components/layout/tolt.script';
+import { useDubClickId } from '@gitroom/frontend/components/layout/dubAnalytics';
+import SafeImage from '@gitroom/react/helpers/safe.image';
+import { useModals } from '@gitroom/frontend/components/layout/new-modal';
+import useCookie from 'react-use-cookie';
+import { LogoutComponent } from '@gitroom/frontend/components/layout/logout.component';
+import { DeveloperIconComponent } from '@gitroom/frontend/components/developer/developer.icon.component';
+import { InvoicesComponent } from '@gitroom/frontend/components/layout/invoices.component';
 
 const ModeComponent = dynamic(
   () => import('@gitroom/frontend/components/layout/mode.component'),
@@ -45,15 +50,24 @@ const EmbeddedBilling = dynamic(
 export const FirstBillingComponent = () => {
   const { stripeClient } = useVariables();
   const user = useUser();
+  const dub = useDubClickId();
   const [stripe, setStripe] = useState<null | Promise<Stripe>>(null);
+  const [stripeFailed, setStripeFailed] = useState(false);
   const [tier, setTier] = useState('STANDARD');
   const [period, setPeriod] = useState('MONTHLY');
   const fetch = useFetch();
+  const { mutate } = useSWRConfig();
+  const modals = useModals();
   const t = useT();
-  const tolt = useTolt();
+  const [datafast_visitor_id] = useCookie('datafast_visitor_id', '');
+  const [datafast_session_id] = useCookie('datafast_session_id', '');
+  const [fbc] = useCookie('_fbc', '');
+  const [fbp] = useCookie('_fbp', '');
 
   useEffect(() => {
-    setStripe(loadStripe(stripeClient));
+    const stripePromise = loadStripe(stripeClient);
+    stripePromise.catch(() => setStripeFailed(true));
+    setStripe(stripePromise);
   }, []);
 
   const loadCheckout = useCallback(async () => {
@@ -63,11 +77,31 @@ export const FirstBillingComponent = () => {
         body: JSON.stringify({
           billing: tier,
           period: period,
-          tolt: tolt(),
+          ...(datafast_visitor_id && datafast_session_id
+            ? { datafast_visitor_id, datafast_session_id }
+            : {}),
+          ...(dub ? { dub } : {}),
+          ...(fbc ? { fbc } : {}),
+          ...(fbp ? { fbp } : {}),
         }),
       })
     ).json();
   }, [tier, period]);
+
+  const showYouTube = () => {
+    modals.openModal({
+      title: 'Grow Fast With Postiz (Play the video)',
+      children: (
+        <iframe
+          className="h-full aspect-video min-w-[800px]"
+          src="https://www.youtube.com/embed/BdsCVvEYgHU?si=vvhaZJ8I5oXXvVJS?autoplay=1"
+          title="Postiz Tutorial"
+          allow="autoplay"
+          allowFullScreen
+        />
+      ),
+    });
+  };
 
   const { data, isLoading } = useSWR(
     `/billing-${tier}-${period}`,
@@ -81,6 +115,12 @@ export const FirstBillingComponent = () => {
     }
   );
 
+  useEffect(() => {
+    if (data?.blocked) {
+      mutate('/user/self');
+    }
+  }, [data?.blocked, mutate]);
+
   const price = useMemo(
     () => Object.entries(pricing).filter(([key, value]) => key !== 'FREE'),
     []
@@ -92,13 +132,28 @@ export const FirstBillingComponent = () => {
         <div className="text-[46px] font-[600] leading-[110%] tablet:text-[36px] mobile:!text-[30px] whitespace-pre-line text-balance">
           {t('billing_join_over', 'Join Over')}{' '}
           <span className="text-[#FC69FF]">
-            {t('billing_entrepreneurs_count', '18,000+ Entrepreneurs')}
+            {t('billing_entrepreneurs_count', '20,000+ Entrepreneurs')}
           </span>{' '}
           {t('billing_who_use', 'who use')}{' '}
           {t(
             'billing_postiz_grow_social',
             'Postiz To Grow Their Social Presence'
           )}
+        </div>
+
+        <div className="flex" onClick={showYouTube}>
+          <div className="tablet:mb-[32px] cursor-pointer mt-[32px] flex gap-[10px] items-center underline hover:font-[700]">
+            <div>
+              <SafeImage
+                className="text-[12px]"
+                src="/icons/platforms/youtube.svg"
+                width={22.5}
+                height={16}
+                alt="YouTube"
+              />
+            </div>
+            <div>See the power of Postiz (click here)</div>
+          </div>
         </div>
 
         {!!user?.allowTrial && (
@@ -125,7 +180,7 @@ export const FirstBillingComponent = () => {
                 <CheckIconComponent />
               </div>
               <div>
-                {t('billing_cancel_anytime', 'Cancel anytime, hassle-free')}
+                {t('billing_cancel_anytime', 'Cancel anytime, from settings')}
               </div>
             </div>
           </div>
@@ -143,6 +198,7 @@ export const FirstBillingComponent = () => {
         <div className="flex items-center">
           <div className="flex gap-[20px] text-textItemBlur">
             <OrganizationSelector />
+            <InvoicesComponent />
             <div className="hover:text-newTextColor">
               <ModeComponent />
             </div>
@@ -150,25 +206,51 @@ export const FirstBillingComponent = () => {
             <LanguageComponent />
             <div className="w-[1px] h-[20px] bg-blockSeparator" />
             <AttachToFeedbackIcon />
-            <NotificationComponent />
+            <DeveloperIconComponent />
+            {/*<NotificationComponent />*/}
+            <div className="hover:text-newTextColor">
+              {user?.tier.current === 'FREE' && (
+                <LogoutComponent isIcon={true} />
+              )}
+            </div>
           </div>
         </div>
       </div>
       <div className="flex px-[80px] tablet:px-[32px] mobile:!px-[16px] flex-1 flex-row tablet:flex-none tablet:flex-col-reverse">
         <div className="flex-1 py-[40px] tablet:pt-[80px] flex flex-col pe-[40px] tablet:pe-0">
-          <div className="block tablet:hidden"><JoinOver /></div>
-          {!isLoading && data && stripe ? (
-            <>
-              <EmbeddedBilling stripe={stripe} secret={data.client_secret} />
-              <FAQComponent />
-            </>
+          <div className="block tablet:hidden">
+            <JoinOver />
+          </div>
+          {data?.blocked ? (
+            <div className="mt-[24px] p-[24px] rounded-[20px] border-[1.5px] border-newColColor text-[16px] font-[500]">
+              {t(
+                'billing_other_account_subscribed',
+                'Another account with this email already has an active subscription. Please log off and sign in to that account to manage your subscription.'
+              )}
+            </div>
+          ) : stripeFailed ? (
+            <div className="mt-[24px] p-[24px] rounded-[20px] border-[1.5px] border-newColColor text-[16px] font-[500]">
+              {t(
+                'billing_stripe_load_failed',
+                'The payment form could not be loaded. Please disable ad blockers or privacy extensions for this page and reload.'
+              )}
+            </div>
+          ) : !isLoading && data && stripe ? (
+            <EmbeddedBilling
+              stripe={stripe}
+              secret={data.client_secret}
+              showCoupon={period === 'MONTHLY'}
+              autoApplyCoupon={data.auto_apply_coupon}
+            />
           ) : (
             <LoadingComponent />
           )}
         </div>
         <div className="flex flex-col ps-[40px] tablet:!ps-[0] border-l border-newColColor py-[40px] mobile:!pt-[24px] tablet:border-none tablet:pb-0">
           <div className="top-[20px] sticky">
-            <div className="hidden tablet:block"><JoinOver /></div>
+            <div className="hidden tablet:block">
+              <JoinOver />
+            </div>
             <div className="flex mb-[24px] mobile:flex-col">
               <div className="flex-1 text-[24px] font-[700]">
                 {t('billing_choose_plan', 'Choose a Plan')}
@@ -241,6 +323,10 @@ export const FirstBillingComponent = () => {
               </div>
               <BillingFeatures tier={tier} />
             </div>
+            <div className="flex flex-col mobile:hidden tablet:hidden">
+              {/*<div>asd</div>*/}
+              <FAQComponent />
+            </div>
           </div>
         </div>
       </div>
@@ -254,7 +340,7 @@ type FeatureItem = {
   prefix?: string | number;
 };
 
-export const BillingFeatures: FC<{ tier: string }> = ({ tier }) => {
+export const useBillingFeatures = (tier: string) => {
   const t = useT();
   const features = useMemo(() => {
     const currentPricing = pricing[tier];
@@ -311,6 +397,13 @@ export const BillingFeatures: FC<{ tier: string }> = ({ tier }) => {
         prefix: currentPricing?.generate_videos,
       });
     }
+    if (currentPricing?.clipping_minutes) {
+      list.push({
+        key: 'billing_clipping_minutes_per_month',
+        defaultValue: 'minutes of AI video clipping per month',
+        prefix: currentPricing?.clipping_minutes,
+      });
+    }
     return list;
   }, [tier]);
 
@@ -324,6 +417,15 @@ export const BillingFeatures: FC<{ tier: string }> = ({ tier }) => {
     }
     return translatedText;
   };
+
+  return features.map((feature) => ({
+    key: feature.key,
+    label: renderFeature(feature),
+  }));
+};
+
+export const BillingFeatures: FC<{ tier: string }> = ({ tier }) => {
+  const features = useBillingFeatures(tier);
 
   return (
     <div className="grid grid-cols-2 mobile:grid-cols-1 gap-y-[8px] gap-x-[32px]">
@@ -343,7 +445,7 @@ export const BillingFeatures: FC<{ tier: string }> = ({ tier }) => {
               />
             </svg>
           </div>
-          <div>{renderFeature(feature)}</div>
+          <div>{feature.label}</div>
         </div>
       ))}
     </div>

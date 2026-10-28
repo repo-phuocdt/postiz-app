@@ -7,12 +7,12 @@ export abstract class ThirdPartyAbstract<T = any> {
   abstract sendData(apiKey: string, data: T): Promise<string>;
   [key: string]: ((apiKey: string, data?: any) => Promise<any>) | undefined;
 }
-
 export interface ThirdPartyParams {
   identifier: string;
   title: string;
   description: string;
-  position: 'media' | 'webhook';
+  // where a connected integration shows up in the post editor
+  position?: 'media' | 'media-library' | 'webhook';
   fields: {
     name: string;
     description: string;
@@ -20,6 +20,9 @@ export interface ThirdPartyParams {
     placeholder: string;
     validation?: RegExp;
   }[];
+  // An integration installed on the other platform instead of connected here
+  // with an API key: the list opens this link. undefined hides it
+  installUrl?: () => string | undefined;
 }
 
 export function ThirdParty(params: ThirdPartyParams) {

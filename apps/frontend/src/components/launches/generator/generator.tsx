@@ -1,3 +1,5 @@
+'use client';
+
 import React, { FC, useCallback, useMemo, useState } from 'react';
 import { useUser } from '@gitroom/frontend/components/layout/user.context';
 import { useRouter } from 'next/navigation';
@@ -15,15 +17,17 @@ import {
   CalendarWeekProvider,
   useCalendar,
 } from '@gitroom/frontend/components/launches/calendar.context';
-import dayjs from 'dayjs';
+import { fromUtc } from '@gitroom/frontend/components/layout/set.timezone';
 import { Select } from '@gitroom/react/form/select';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { AddEditModal } from '@gitroom/frontend/components/new-launch/add.edit.modal';
-import { ModalWrapperComponent } from '@gitroom/frontend/components/new-launch/modal.wrapper.component';
+import { useToaster } from '@gitroom/react/toaster/toaster';
+
 const FirstStep: FC = (props) => {
   const { integrations, reloadCalendarView } = useCalendar();
   const modal = useModals();
   const fetch = useFetch();
+  const toaster = useToaster();
   const [loading, setLoading] = useState(false);
   const [showStep, setShowStep] = useState('');
   const t = useT();
@@ -57,8 +61,23 @@ const FirstStep: FC = (props) => {
         for (const chunk of chunkStr
           .split('\n')
           .filter((f) => f && f.indexOf('{') > -1)) {
+          let data: any;
           try {
-            const data = JSON.parse(chunk);
+            data = JSON.parse(chunk);
+          } catch (e) {
+            /** ignore partial / unparseable chunks **/
+            continue;
+          }
+
+          // Server emits this when a node in the generation graph throws.
+          if (data?.error) {
+            throw new Error(
+              data.message ||
+                t('generation_failed', 'Failed to generate posts, please try again.')
+            );
+          }
+
+          {
             switch (data.name) {
               case 'agent':
                 setShowStep(t('agent_starting', 'Agent starting'));
@@ -106,8 +125,6 @@ const FirstStep: FC = (props) => {
                 break;
             }
             lastResponse = data;
-          } catch (e) {
-            /** don't do anything **/
           }
         }
       }
@@ -119,66 +136,83 @@ const FirstStep: FC = (props) => {
   }> = useCallback(
     async (value) => {
       setLoading(true);
-      const response = await fetch('/posts/generator', {
-        method: 'POST',
-        body: JSON.stringify(value),
-      });
-      if (!response.body) {
-        return;
-      }
-      const reader = response.body.getReader();
-      const load = await generateStep(reader);
-      const messages = load.content.map((p: any, index: number) => {
-        if (index === 0) {
+      try {
+        const response = await fetch('/posts/generator', {
+          method: 'POST',
+          body: JSON.stringify(value),
+        });
+        if (!response.body) {
+          throw new Error(
+            t('generation_failed', 'Failed to generate posts, please try again.')
+          );
+        }
+        const reader = response.body.getReader();
+        const load = await generateStep(reader);
+        if (!load?.content) {
+          throw new Error(
+            t('generation_failed', 'Failed to generate posts, please try again.')
+          );
+        }
+        const messages = load.content.map((p: any, index: number) => {
+          if (index === 0) {
+            return {
+              content: load.hook + '\n' + p.content,
+              ...(p?.image?.path
+                ? {
+                    image: [p.image],
+                  }
+                : {}),
+            };
+          }
           return {
-            content: load.hook + '\n' + p.content,
+            content: p.content,
             ...(p?.image?.path
               ? {
                   image: [p.image],
                 }
               : {}),
           };
-        }
-        return {
-          content: p.content,
-          ...(p?.image?.path
-            ? {
-                image: [p.image],
-              }
-            : {}),
-        };
-      });
-      setShowStep('');
-      modal.openModal({
-        id: 'add-edit-modal',
-        closeOnClickOutside: false,
-        removeLayout: true,
-        closeOnEscape: false,
-        withCloseButton: false,
-        askClose: true,
-        fullScreen: true,
-        classNames: {
-          modal: 'w-[100%] max-w-[1400px] text-textColor',
-        },
-        children: (
-          <AddEditModal
-            allIntegrations={integrations.map((p) => ({
-              ...p,
-            }))}
-            integrations={integrations.slice(0).map((p) => ({
-              ...p,
-            }))}
-            mutate={reloadCalendarView}
-            date={dayjs.utc(load.date).local()}
-            reopenModal={() => ({})}
-            onlyValues={messages}
-          />
-        ),
-        size: '80%',
-      });
-      setLoading(false);
+        });
+        setShowStep('');
+        modal.openModal({
+          id: 'add-edit-modal',
+          closeOnClickOutside: false,
+          removeLayout: true,
+          closeOnEscape: false,
+          withCloseButton: false,
+          askClose: true,
+          fullScreen: true,
+          classNames: {
+            modal: 'w-[100%] max-w-[1400px] text-textColor',
+          },
+          children: (
+            <AddEditModal
+              allIntegrations={integrations.map((p) => ({
+                ...p,
+              }))}
+              integrations={integrations.slice(0).map((p) => ({
+                ...p,
+              }))}
+              mutate={reloadCalendarView}
+              date={fromUtc(load.date)}
+              reopenModal={() => ({})}
+              onlyValues={messages}
+            />
+          ),
+          size: '80%',
+        });
+      } catch (e: any) {
+        toaster.show(
+          e?.message ||
+            t('generation_failed', 'Failed to generate posts, please try again.'),
+          'warning'
+        );
+      } finally {
+        setShowStep('');
+        setLoading(false);
+      }
     },
-    [integrations, reloadCalendarView]
+    [integrations, reloadCalendarView, fetch, generateStep, modal, toaster, t]
   );
   return (
     <form
@@ -295,9 +329,9 @@ export const GeneratorComponent = () => {
     if (!user?.tier?.ai) {
       if (
         await deleteDialog(
-          'You need to upgrade to use this feature',
-          'Move to billing',
-          'Payment Required'
+          t('upgrade_required', 'You need to upgrade to use this feature'),
+          t('move_to_billing', 'Move to billing'),
+          t('payment_required', 'Payment Required')
         )
       ) {
         router.push('/billing');
@@ -305,7 +339,7 @@ export const GeneratorComponent = () => {
       return;
     }
     modal.openModal({
-      title: 'Generate Posts',
+      title: t('generate_posts', 'Generate Posts'),
       withCloseButton: false,
       classNames: {
         modal: 'bg-transparent text-textColor',

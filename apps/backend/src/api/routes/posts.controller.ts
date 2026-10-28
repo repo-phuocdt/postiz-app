@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  HttpException,
   Param,
   Post,
   Put,
@@ -13,10 +14,9 @@ import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/po
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 import { Organization, User } from '@prisma/client';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
-import { StarsService } from '@gitroom/nestjs-libraries/database/prisma/stars/stars.service';
+import { GetPostsListDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.list.dto';
 import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
 import { ApiTags } from '@nestjs/swagger';
-import { MessagesService } from '@gitroom/nestjs-libraries/database/prisma/marketplace/messages.service';
 import { GeneratorDto } from '@gitroom/nestjs-libraries/dtos/generator/generator.dto';
 import { CreateGeneratedPostsDto } from '@gitroom/nestjs-libraries/dtos/generator/create.generated.posts.dto';
 import { AgentGraphService } from '@gitroom/nestjs-libraries/agent/agent.graph.service';
@@ -24,15 +24,22 @@ import { Response } from 'express';
 import { GetUserFromRequest } from '@gitroom/nestjs-libraries/user/user.from.request';
 import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
 import { CreateTagDto } from '@gitroom/nestjs-libraries/dtos/posts/create.tag.dto';
-import { AuthorizationActions, Sections } from '@gitroom/backend/services/auth/permissions/permission.exception.class';
+import {
+  AuthorizationActions,
+  Sections,
+} from '@gitroom/backend/services/auth/permissions/permission.exception.class';
+import { PostValidationException } from '@gitroom/backend/api/routes/posts.validation.exception';
+import {
+  CreatePublicCommentDto,
+  ResolveCommentDto,
+} from '@gitroom/nestjs-libraries/dtos/comments/add.comment.dto';
+import { RealIP } from 'nestjs-real-ip';
 
 @ApiTags('Posts')
 @Controller('/posts')
 export class PostsController {
   constructor(
     private _postsService: PostsService,
-    private _starsService: StarsService,
-    private _messagesService: MessagesService,
     private _agentGraphService: AgentGraphService,
     private _shortLinkService: ShortLinkService
   ) {}
@@ -45,27 +52,53 @@ export class PostsController {
     return this._postsService.getStatistics(org.id, id);
   }
 
+  @Get('/:id/missing')
+  async getMissingContent(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    return this._postsService.getMissingContent(org.id, id);
+  }
+
+  @Get('/:id/release-url')
+  async getReleaseURL(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    return this._postsService.getReleaseURL(org.id, id);
+  }
+
+  @Put('/:id/release-id')
+  async updateReleaseId(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body('releaseId') releaseId: string
+  ) {
+    return this._postsService.updateReleaseId(org.id, id, releaseId);
+  }
+
   @Post('/should-shortlink')
   async shouldShortlink(@Body() body: { messages: string[] }) {
     return { ask: this._shortLinkService.askShortLinkedin(body.messages) };
   }
 
-  @Get('/marketplace/:id')
-  async getMarketplacePosts(
-    @GetOrgFromRequest() org: Organization,
-    @Param('id') id: string
-  ) {
-    return this._messagesService.getMarketplaceAvailableOffers(org.id, id);
-  }
-
   @Post('/:id/comments')
   async createComment(
-    @GetOrgFromRequest() org: Organization,
     @GetUserFromRequest() user: User,
     @Param('id') id: string,
-    @Body() body: { comment: string }
+    @Body() body: CreatePublicCommentDto,
+    @RealIP() ip: string
   ) {
-    return this._postsService.createComment(org.id, user.id, id, body.comment);
+    return this._postsService.createPublicComment(id, body, user.id, ip);
+  }
+
+  @Put('/comments/:commentId/resolve')
+  async resolveComment(
+    @GetOrgFromRequest() org: Organization,
+    @Param('commentId') commentId: string,
+    @Body() body: ResolveCommentDto
+  ) {
+    return this._postsService.resolveComment(org.id, commentId, body.resolved);
   }
 
   @Get('/tags')
@@ -90,16 +123,20 @@ export class PostsController {
     return this._postsService.editTag(id, org.id, body);
   }
 
+  @Delete('/tags/:id')
+  async deleteTag(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    return this._postsService.deleteTag(id, org.id);
+  }
+
   @Get('/')
   async getPosts(
     @GetOrgFromRequest() org: Organization,
     @Query() query: GetPostsDto
   ) {
-    const posts = await this._postsService.getPosts(org.id, query);
-
-    return {
-      posts,
-    };
+    return this._postsService.getPostsMinified(org.id, query);
   }
 
   @Get('/find-slot')
@@ -115,9 +152,12 @@ export class PostsController {
     return { date: await this._postsService.findFreeDateTime(org.id, id) };
   }
 
-  @Get('/predict-trending')
-  predictTrending() {
-    return this._starsService.predictTrending();
+  @Get('/list')
+  async getPostsList(
+    @GetOrgFromRequest() org: Organization,
+    @Query() query: GetPostsListDto
+  ) {
+    return this._postsService.getPostsList(org.id, query);
   }
 
   @Get('/old')
@@ -128,9 +168,37 @@ export class PostsController {
     return this._postsService.getOldPosts(org.id, date);
   }
 
+  @Get('/group/:group/debug-export')
+  async getPostGroupDebugExport(
+    @GetOrgFromRequest() org: Organization,
+    @GetUserFromRequest() user: User,
+    @Param('group') group: string
+  ) {
+    if (!user.isSuperAdmin) {
+      throw new HttpException('Forbidden', 403);
+    }
+    return this._postsService.getPostGroupDebugExport(org.id, group);
+  }
+
+  @Get('/group/:group')
+  getPostsByGroup(
+    @GetOrgFromRequest() org: Organization,
+    @Param('group') group: string
+  ) {
+    return this._postsService.getPostsByGroup(org.id, group);
+  }
+
   @Get('/:id')
   getPost(@GetOrgFromRequest() org: Organization, @Param('id') id: string) {
     return this._postsService.getPost(org.id, id);
+  }
+
+  @Post('/valid')
+  async validatePosts(
+    @GetOrgFromRequest() org: Organization,
+    @Body() rawBody: any
+  ) {
+    return this._postsService.validatePosts(org.id, rawBody?.posts || []);
   }
 
   @Post('/')
@@ -139,9 +207,45 @@ export class PostsController {
     @GetOrgFromRequest() org: Organization,
     @Body() rawBody: any
   ) {
-    console.log(JSON.stringify(rawBody, null, 2));
+    // Server-side validation — never trust the client to have validated.
+    const validation = await this._postsService.validatePosts(
+      org.id,
+      rawBody?.posts || []
+    );
+
+    const fail = (item: (typeof validation)[number], error: string) => {
+      throw new PostValidationException({
+        provider: item.identifier,
+        name: item.name,
+        error,
+      });
+    };
+
+    for (const item of validation) {
+      if (item.emptyContent) {
+        fail(
+          item,
+          'Your post should have at least one character or one image.'
+        );
+      }
+    }
+
+    if (rawBody?.type !== 'draft') {
+      for (const item of validation) {
+        if (!item.valid) {
+          fail(item, item.settingsError || 'Please fix your settings');
+        }
+        if (item.errors !== true) {
+          fail(item, item.errors as string);
+        }
+        if (item.tooLong) {
+          fail(item, 'post is too long, please fix it');
+        }
+      }
+    }
+
     const body = await this._postsService.mapTypeToPost(rawBody, org.id);
-    return this._postsService.createPost(org.id, body);
+    return this._postsService.createPost(org.id, body, 'WEB');
   }
 
   @Post('/generator/draft')
@@ -161,8 +265,21 @@ export class PostsController {
     @Res({ passthrough: false }) res: Response
   ) {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    for await (const event of this._agentGraphService.start(org.id, body)) {
-      res.write(JSON.stringify(event) + '\n');
+    try {
+      for await (const event of this._agentGraphService.start(org.id, body)) {
+        res.write(JSON.stringify(event) + '\n');
+      }
+    } catch (err) {
+      // The stream has already started, so we cannot surface a normal HTTP
+      // error here. Emit a final error event on the open stream instead, so the
+      // client can stop and show the message rather than hang on a truncated
+      // stream. HttpExceptions carry a curated, user-facing message (e.g. the
+      // AI safety rejection); anything else gets a generic message.
+      const message =
+        err instanceof HttpException
+          ? err.message
+          : 'Something went wrong while generating your posts, please try again.';
+      res.write(JSON.stringify({ name: 'error', error: true, message }) + '\n');
     }
 
     res.end();
@@ -180,9 +297,13 @@ export class PostsController {
   changeDate(
     @GetOrgFromRequest() org: Organization,
     @Param('id') id: string,
-    @Body('date') date: string
+    @Body('date') date: string,
+    // 'update' is the safe default: clients that don't send an action must
+    // never requeue (and thereby republish) a post by accident
+    @Body('action') action: 'schedule' | 'update' = 'update',
+    @Body('republish') republish = false
   ) {
-    return this._postsService.changeDate(org.id, id, date);
+    return this._postsService.changeDate(org.id, id, date, action, republish);
   }
 
   @Post('/separate-posts')

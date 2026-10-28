@@ -4,13 +4,18 @@ import {
   PostResponse,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
-import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
-import { SocialAbstract } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
+import {
+  BadBody,
+  RefreshToken,
+  SocialAbstract,
+  ValidityMedia,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import dayjs from 'dayjs';
 import { Integration } from '@prisma/client';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
 import { LemmySettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/lemmy.dto';
-import { groupBy } from 'lodash';
+import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
 
 export class LemmyProvider extends SocialAbstract implements SocialProvider {
@@ -24,6 +29,81 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
     return 10000;
   }
   dto = LemmySettingsDto;
+
+  override handleErrors(
+    body: string,
+    status: number
+  ):
+    | { type: 'refresh-token' | 'bad-body' | 'retry'; value: string }
+    | undefined {
+    if (body.includes('rate_limit_error')) {
+      return {
+        type: 'retry',
+        value: 'Lemmy rate limit reached, please try again later',
+      };
+    }
+
+    if (body.includes('not_logged_in') || body.includes('incorrect_login')) {
+      return {
+        type: 'refresh-token',
+        value: 'Lemmy session is no longer valid, please reconnect the channel',
+      };
+    }
+
+    if (body.includes('site_ban') || body.includes('"error":"banned"')) {
+      return {
+        type: 'bad-body',
+        value: 'This account is banned on the Lemmy instance',
+      };
+    }
+
+    if (body.includes('couldnt_find_community')) {
+      return {
+        type: 'bad-body',
+        value:
+          'The selected Lemmy community no longer exists, please pick another one',
+      };
+    }
+
+    if (body.includes('blocked_url')) {
+      return {
+        type: 'bad-body',
+        value: 'The Lemmy instance blocks the URL in this post',
+      };
+    }
+
+    if (body.includes('"error":"deleted"')) {
+      return {
+        type: 'bad-body',
+        value: 'The selected Lemmy community or post was deleted',
+      };
+    }
+
+    if (body.includes('"error":"locked"')) {
+      return {
+        type: 'bad-body',
+        value: 'This Lemmy post is locked, comments cannot be added',
+      };
+    }
+
+    return undefined;
+  }
+
+  override async checkValidity(
+    items: Array<ValidityMedia[]>
+  ): Promise<string | true> {
+    const [firstItems] = items ?? [];
+    if (
+      firstItems?.length &&
+      (firstItems?.[0]?.path?.indexOf?.('png') ?? -1) === -1 &&
+      (firstItems?.[0]?.path?.indexOf?.('jpg') ?? -1) === -1 &&
+      (firstItems?.[0]?.path?.indexOf?.('jpef') ?? -1) === -1 &&
+      (firstItems?.[0]?.path?.indexOf?.('gif') ?? -1) === -1
+    ) {
+      return 'You can set only one picture for a cover';
+    }
+    return true;
+  }
 
   async customFields() {
     return [
@@ -62,10 +142,10 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
   }
 
   async generateAuthUrl() {
-    const state = makeId(6);
+    const state = makeSecureId(6);
     return {
-      url: '',
-      codeVerifier: makeId(10),
+      url: state,
+      codeVerifier: makeSecureId(10),
       state,
     };
   }
@@ -78,6 +158,8 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
     const body = JSON.parse(Buffer.from(params.code, 'base64').toString());
 
     const load = await fetch(body.service + '/api/v3/user/login', {
+      // @ts-ignore - undici-only option; blocks SSRF to internal IPs
+      dispatcher: getSsrfSafeDispatcher(),
       body: JSON.stringify({
         username_or_email: body.identifier,
         password: body.password,
@@ -97,6 +179,8 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
     try {
       const user = await (
         await fetch(body.service + `/api/v3/user?username=${body.identifier}`, {
+          // @ts-ignore - undici-only option; blocks SSRF to internal IPs
+          dispatcher: getSsrfSafeDispatcher(),
           headers: {
             Authorization: `Bearer ${jwt}`,
           },
@@ -121,46 +205,71 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
     }
   }
 
+  private async getJwtAndService(integration: Integration): Promise<{ jwt: string; service: string }> {
+    const body = JSON.parse(
+      AuthService.fixedDecryption(integration.customInstanceDetails!)
+    );
+
+    const options = {
+      // @ts-ignore - undici-only option; blocks SSRF to internal IPs
+      dispatcher: getSsrfSafeDispatcher(),
+      body: JSON.stringify({
+        username_or_email: body.identifier,
+        password: body.password,
+      }),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    };
+
+    let login: Response;
+    try {
+      login = await this.fetch(body.service + '/api/v3/user/login', options);
+    } catch (err) {
+      // The request body holds the stored password, so the failure is rebuilt
+      // without it before it reaches the Temporal history and the Errors table.
+      const json = (err as any).details?.[0]?.json || '{}';
+      if (err instanceof BadBody) {
+        throw new BadBody(
+          this.identifier,
+          json,
+          {} as BodyInit,
+          err.message || 'Unknown Error'
+        );
+      }
+      if (err instanceof RefreshToken) {
+        throw new RefreshToken(
+          this.identifier,
+          json,
+          {} as BodyInit,
+          err.message || 'Unknown Error'
+        );
+      }
+      throw err;
+    }
+
+    const { jwt } = await login.json();
+
+    return { jwt, service: body.service };
+  }
+
   async post(
     id: string,
     accessToken: string,
     postDetails: PostDetails<LemmySettingsDto>[],
     integration: Integration
   ): Promise<PostResponse[]> {
-    const [firstPost, ...restPosts] = postDetails;
-
-    const body = JSON.parse(
-      AuthService.fixedDecryption(integration.customInstanceDetails!)
-    );
-
-    const { jwt } = await (
-      await fetch(body.service + '/api/v3/user/login', {
-        body: JSON.stringify({
-          username_or_email: body.identifier,
-          password: body.password,
-        }),
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
-    ).json();
+    const [firstPost] = postDetails;
+    const { jwt, service } = await this.getJwtAndService(integration);
 
     const valueArray: PostResponse[] = [];
 
     for (const lemmy of firstPost.settings.subreddit) {
-      console.log({
-        community_id: +lemmy.value.id,
-        name: lemmy.value.title,
-        body: firstPost.message,
-        ...(lemmy.value.url ? { url: lemmy.value.url } : {}),
-        ...(firstPost.media?.length
-          ? { custom_thumbnail: firstPost.media[0].path }
-          : {}),
-        nsfw: false,
-      });
-      const { post_view, ...all } = await (
-        await fetch(body.service + '/api/v3/post', {
+      const { post_view } = await (
+        await this.fetch(service + '/api/v3/post', {
+          // @ts-ignore - undici-only option; blocks SSRF to internal IPs
+          dispatcher: getSsrfSafeDispatcher(),
           body: JSON.stringify({
             community_id: +lemmy.value.id,
             name: lemmy.value.title,
@@ -188,41 +297,70 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
 
       valueArray.push({
         postId: post_view.post.id,
-        releaseURL: body.service + '/post/' + post_view.post.id,
+        releaseURL: service + '/post/' + post_view.post.id,
         id: firstPost.id,
         status: 'published',
       });
-
-      for (const comment of restPosts) {
-        const { comment_view } = await (
-          await fetch(body.service + '/api/v3/comment', {
-            body: JSON.stringify({
-              post_id: post_view.post.id,
-              content: comment.message,
-            }),
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${jwt}`,
-              'Content-Type': 'application/json',
-            },
-          })
-        ).json();
-
-        valueArray.push({
-          postId: comment_view.post.id,
-          releaseURL: body.service + '/comment/' + comment_view.comment.id,
-          id: comment.id,
-          status: 'published',
-        });
-      }
     }
 
-    return Object.values(groupBy(valueArray, (p) => p.id)).map((p) => ({
-      id: p[0].id,
-      postId: p.map((p) => String(p.postId)).join(','),
-      releaseURL: p.map((p) => p.releaseURL).join(','),
-      status: 'published',
-    }));
+    return [
+      {
+        id: firstPost.id,
+        postId: valueArray.map((p) => String(p.postId)).join(','),
+        releaseURL: valueArray.map((p) => p.releaseURL).join(','),
+        status: 'published',
+      },
+    ];
+  }
+
+  async comment(
+    id: string,
+    postId: string,
+    lastCommentId: string | undefined,
+    accessToken: string,
+    postDetails: PostDetails<LemmySettingsDto>[],
+    integration: Integration
+  ): Promise<PostResponse[]> {
+    const [commentPost] = postDetails;
+    const { jwt, service } = await this.getJwtAndService(integration);
+
+    // postId can be comma-separated if posted to multiple communities
+    const postIds = postId.split(',');
+    const valueArray: PostResponse[] = [];
+
+    for (const singlePostId of postIds) {
+      const { comment_view } = await (
+        await this.fetch(service + '/api/v3/comment', {
+          // @ts-ignore - undici-only option; blocks SSRF to internal IPs
+          dispatcher: getSsrfSafeDispatcher(),
+          body: JSON.stringify({
+            post_id: +singlePostId,
+            content: commentPost.message,
+          }),
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${jwt}`,
+            'Content-Type': 'application/json',
+          },
+        })
+      ).json();
+
+      valueArray.push({
+        postId: String(comment_view.comment.id),
+        releaseURL: service + '/comment/' + comment_view.comment.id,
+        id: commentPost.id,
+        status: 'published',
+      });
+    }
+
+    return [
+      {
+        id: commentPost.id,
+        postId: valueArray.map((p) => p.postId).join(','),
+        releaseURL: valueArray.map((p) => p.releaseURL).join(','),
+        status: 'published',
+      },
+    ];
   }
 
   @Tool({
@@ -241,28 +379,14 @@ export class LemmyProvider extends SocialAbstract implements SocialProvider {
     id: string,
     integration: Integration
   ) {
-    const body = JSON.parse(
-      AuthService.fixedDecryption(integration.customInstanceDetails!)
-    );
-
-    const { jwt } = await (
-      await fetch(body.service + '/api/v3/user/login', {
-        body: JSON.stringify({
-          username_or_email: body.identifier,
-          password: body.password,
-        }),
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      })
-    ).json();
+    const { jwt, service } = await this.getJwtAndService(integration);
 
     const { communities } = await (
-      await fetch(
-        body.service +
-          `/api/v3/search?type_=Communities&sort=Active&q=${data.word}`,
+      await this.fetch(
+        service + `/api/v3/search?type_=Communities&sort=Active&q=${data.word}`,
         {
+          // @ts-ignore - undici-only option; blocks SSRF to internal IPs
+          dispatcher: getSsrfSafeDispatcher(),
           headers: {
             Authorization: `Bearer ${jwt}`,
           },
